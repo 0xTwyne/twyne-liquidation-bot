@@ -1,0 +1,2 @@
+forge-std/=lib/forge-std/src/
+ethereum-vault-connector/interfaces/=lib/evk-periphery/lib/ethereum-vault-connector/src/interfaces/

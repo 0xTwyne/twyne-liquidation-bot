@@ -1,0 +1,182 @@
+global:
+  ## RISK PARAMETERS ##
+  # Health score bounds for update interval frequency
+  HS_LIQUIDATION: 1.0
+  HS_HIGH_RISK: 1.05
+  HS_SAFE: 1.25
+
+  # Position size bounds for update interval frequency
+  TEENY: 10000000000000000000 # $10
+  MINI: 100000000000000000000 # $100
+  SMALL: 1000000000000000000000 # $1000
+  MEDIUM: 10000000000000000000000 # $10000
+
+  # Interval Update Frequency Matrix
+  TEENY_LIQ: 15
+  TEENY_HIGH: 30
+  TEENY_LOW: 3600
+  TEENY_SAFE: 7200
+
+  MINI_LIQ: 15
+  MINI_HIGH: 30
+  MINI_LOW: 3600
+  MINI_SAFE: 7200
+
+  SMALL_LIQ: 15
+  SMALL_HIGH: 30
+  SMALL_LOW: 3600
+  SMALL_SAFE: 7200
+
+  MEDIUM_LIQ: 15
+  MEDIUM_HIGH: 30
+  MEDIUM_LOW: 3600
+  MEDIUM_SAFE: 7200
+
+  LARGE_LIQ: 15
+  LARGE_HIGH: 30
+  LARGE_LOW: 3600
+  LARGE_SAFE: 3600
+
+  # Update interval frequency (in seconds)
+  MIN_UPDATE_INTERVAL_SMALL: 300
+  HIGH_RISK_UPDATE_INTERVAL: 600
+  MAX_UPDATE_INTERVAL: 3600 # 60 minutes
+
+  ## REPORTING PARAMETERS ##
+  # Interval for reporting low health accounts
+  LOW_HEALTH_REPORT_INTERVAL: 10800 # 180 minutes in seconds
+  SLACK_REPORT_HEALTH_SCORE: 1.15
+  BORROW_VALUE_THRESHOLD: 100000 # $0.1 minimum for reporting
+  # Threshold for excluding small positions from frequent notifications, in USD terms
+  SMALL_POSITION_THRESHOLD: 1000000000000000000000 # 1000 USD
+  SMALL_POSITION_REPORT_INTERVAL: 43200 # 2 hours
+  # Cooldown for reporting errors
+  ERROR_COOLDOWN: 900
+
+  ## MONITORING PARAMETERS ##
+  # Maximum time between updates for any vault (even empty ones), in seconds
+  # This ensures no vault is ever "forgotten" - default 1 day
+  MAX_UPDATE_INTERVAL_SECONDS: 86400
+
+  # Batch size for scanning blocks on startup
+  BATCH_SIZE: 10000
+  BATCH_INTERVAL: 0.2
+  # Time to wait between scanning for new collateral vaults on regular intervals
+  SCAN_INTERVAL: 300 # 5 minutes
+
+  ## PATHS ##
+  EVAULT_ABI_PATH: "contracts/EVault.json"
+  ATOKEN_WRAPPER_ABI_PATH: "contracts/AaveV3ATokenWrapper.json"
+  EVC_ABI_PATH: "contracts/EthereumVaultConnector.json"
+  LIQUIDATOR_ABI_PATH: "out/Liquidator.sol/Liquidator.json"
+  ORACLE_ABI_PATH: "contracts/IOracle.json"
+  PYTH_ABI_PATH: "contracts/IPyth.json"
+  ERC20_ABI_PATH: "contracts/IERC20.json"
+  ROUTER_ABI_PATH: "contracts/EulerRouter.json"
+  LOGS_PATH: "logs/account_monitor_logs.log"
+  SAVE_STATE_PATH: "state"
+  SAVE_INTERVAL: 120 # 3 minutes
+
+  ## Twyne
+  CVAULT_FACTORY_ABI_PATH: "contracts/CollateralVaultFactory.json"
+  EULER_CVAULT_ABI_PATH: "contracts/EulerCollateralVault.json"
+  HEALTHSTATVIEWER_ABI_PATH: "contracts/HealthStatViewer.json"
+  VAULT_MANAGER_ABI_PATH: "contracts/VaultManager.json"
+  EULER_ROUTER_ABI_PATH: "contracts/EulerRouter.json"
+  LIQUIDATOR_CONTRACT_ABI_PATH: "out/TwyneLiquidator.sol/TwyneLiquidator.json"
+  LIQ_MODE: 1
+
+  ## Twyne Aave
+  AAVE_CVAULT_ABI_PATH: "contracts/AaveV3CollateralVault.json"
+  AAVE_WRAPPER_ABI_PATH: "contracts/AaveV3ATokenWrapper.json"
+  AAVE_POOL_ABI_PATH: "contracts/AaveV3Pool.json"
+  AAVE_LIQUIDATOR_ABI_PATH: "out/TwyneAaveLiquidator.sol/TwyneAaveLiquidator.json"
+  ## API CALL PARAMETERS ##
+  # API Retry
+  NUM_RETRIES: 3
+  RETRY_DELAY: 10
+  # Acceptable amount of overswapping of collateral for 1INCH binary search
+  API_REQUEST_DELAY: .25
+  SWAP_SLIPPAGE: 1.0 # 1%
+  SWAP_DEADLINE: 300 # 5 minutes
+
+  MAINNET_ETH_ADAPTER: "0x10674C8C1aE2072d4a75FE83f1E159425fd84E1D"
+  MAINNET_ETH_ADDRESS: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+  MAINNET_BTC_ADAPTER: "0x0484Df76f561443d93548D86740b5C4A826e5A33"
+
+  ## ADDRESSES ##
+  USDS_ADDRESS: "0x820C137fa70C8691f0e44Dc420a5e53c168921Dc"
+  ## TWYNE_EOA_VAULTS and SLACK_MENTION_IDS are loaded from environment variables.
+  ## See .env.example for configuration.
+
+chains:
+  # Mainnet
+  1:
+    # Config
+    name: "Ethereum"
+    EVC_DEPLOYMENT_BLOCK: 23233276
+    EXPLORER_URL: "https://etherscan.io"
+    RPC_NAME: "MAINNET_RPC_URL"
+
+    # Twyne
+    CVAULT_FACTORY_DEPLOYMENT_BLOCK: 23239085
+
+    # Deployed contract addresses
+    contracts:
+      # Twyne
+      CVAULT_FACTORY: "0xa1517cCe0bE75700A8838EA1cEE0dc383cd3A332"
+      HEALTHSTATVIEWER_ADDRESS: "0x0dd9065c998E75657BcE6C3a11d7F5AbA5CBdbD4"
+      EULER_LIQUIDATOR_ADDRESS: "0xdf7B35033dd95452BB5Cd37860f61DF54Ca52fCF"
+      AAVE_LIQUIDATOR_ADDRESS: "0xa15368B5b8285955B19E3D3724d28908b8aC8538"
+
+      #EVK Addresses
+      EVC: "0xef39D6493884C4C84D38a4bFF879Ce16CEdE702a"
+      SWAPPER: "0x544410023CBCCb2b141f13a7ceE9D594E6685e65"
+      SWAP_VERIFIER: "0x8DDaCdEA0bB99c378fF52E0c1c45952386C2B807"
+
+      # Other relevant contracts & Units of Account
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+      USD: "0x0000000000000000000000000000000000000348"
+      BTC: "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB"
+      USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      ONEINCHROUTER: "0x111111125421cA6dc452d289314280a0f8842A65"
+
+      # PYTH address
+      PYTH: "0x4305FB66699C3B2702D4d05CF36551390A4c69C6"
+
+  # Base
+  8453:
+    # Config
+    name: "Base"
+    EVC_DEPLOYMENT_BLOCK: 31614932
+    EXPLORER_URL: "https://basescan.org"
+    RPC_NAME: "BASE_RPC_URL"
+
+    # Twyne
+    CVAULT_FACTORY_DEPLOYMENT_BLOCK: 38122653
+
+    # Deployed contract addresses
+    contracts:
+      # Twyne Euler
+      CVAULT_FACTORY: "0x1666FE8Cf509E6B6eC8c1bc6a53674f6Ee1D0381"
+      HEALTHSTATVIEWER_ADDRESS: "0xe002f7C266b0Ae4e32b621BAb56F19f9FeBf3f6E"
+      EULER_LIQUIDATOR_ADDRESS: "0x12bbA444e7A8AdC84024D50Bf7de5070e73b6261"
+
+      # Twyne Aave
+      AAVE_LIQUIDATOR_ADDRESS: "0xf941631FEb2946fbead5197eA9Fae2C244e9915F"
+      AAVE_POOL: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+
+      #EVK Addresses
+      EVC: "0xC36aED7b7816aA21B660a33a637a8f9B9B70ad6c"
+      SWAPPER: "0x0D3d0F97eD816Ca3350D627AD8e57B6AD41774df"
+      SWAP_VERIFIER: "0x30660764A7a05B84608812C8AFC0Cb4845439EEe"
+
+      # Other relevant contracts & Units of Account
+      WETH: "0x4200000000000000000000000000000000000006"
+      USD: "0x0000000000000000000000000000000000000348"
+      BTC: "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB"
+      USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      ONEINCHROUTER: "0x111111125421cA6dc452d289314280a0f8842A65"
+
+      # PYTH address
+      PYTH: "0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a"

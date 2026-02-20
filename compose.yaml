@@ -1,0 +1,14 @@
+services:
+  liquidation-bot:
+    build: .
+    ports:
+      - 8080:8080
+    environment:
+      - LOGS_PATH=/app/logs/account_monitor_logs.log
+    env_file:
+      - .env
+    user: "1000:1000"
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state
+    restart: unless-stopped
