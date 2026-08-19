@@ -1,10 +1,24 @@
 """
 Protocol registry and vault type detection.
 
-There is a single CollateralVaultFactory that emits events for both Euler and Aave
-collateral vaults. To distinguish them, we call .aToken() on the vault using the
-Aave ABI (superset). If it succeeds, it's Aave; if it reverts, it's Euler.
+A single CollateralVaultFactory emits T_CollateralVaultCreated for both Euler-
+and Aave-backed CVs. The two variants share the same proxy front-end, so we
+classify by calling `targetVault()` on the CV:
+
+  - Aave CV  → `targetVault` is the Aave Pool (the same pool address for every
+               Aave CV on the chain)
+  - Euler CV → `targetVault` is a per-asset Euler EVault (an EVK vault that
+               holds the borrowed asset)
+
+Why not `aToken()`? The CV proxy enforces an EVC-style guard that reverts on
+direct view-function calls with selector `0x335c5fec` for **both** variants,
+so the older `aToken()` probe could not distinguish them and silently
+classified everything as Euler. `targetVault()` is callable on both proxies
+without that guard, which is why we use it. See the test file for a
+reproduction.
 """
+
+from web3 import Web3
 
 from app.liquidation.contracts import create_contract_instance
 from app.liquidation.logging_config import setup_logger
@@ -33,21 +47,24 @@ def get_vault_class_for_protocol(protocol: str):
 
 def detect_protocol(address: str, config) -> str:
     """
-    Detect whether a collateral vault is Euler or Aave by calling .aToken().
-    Uses the Aave ABI (superset of Euler ABI). If .aToken() reverts, it's Euler.
+    Detect whether a collateral vault is Aave- or Euler-backed.
 
-    Returns:
-        "aave" or "euler"
+    Compares the CV's on-chain `targetVault()` against the configured Aave
+    Pool address. Matching → Aave; anything else → Euler.
+
+    Raises on RPC failure rather than silently defaulting, so a misroute
+    can't masquerade as a normal "Euler" classification.
     """
-    try:
-        instance = create_contract_instance(address, config.AAVE_CVAULT_ABI_PATH, config)
-        atoken = instance.functions.aToken().call()
-        # If call succeeds and returns a non-zero address, it's Aave
-        if atoken and atoken != "0x0000000000000000000000000000000000000000":
-            logger.info("detect_protocol: %s is Aave (aToken=%s)", address, atoken)
-            return "aave"
-    except Exception as ex:
-        logger.debug("detect_protocol: aToken() call failed for %s: %s", address, ex)
+    checksum_address = Web3.to_checksum_address(address)
+    aave_pool = Web3.to_checksum_address(config.AAVE_POOL)
 
-    logger.info("detect_protocol: %s is Euler (aToken() reverted or returned zero)", address)
+    # The AAVE CV ABI is a superset (both proxies expose targetVault()).
+    instance = create_contract_instance(checksum_address, config.AAVE_CVAULT_ABI_PATH, config)
+    target_vault = Web3.to_checksum_address(instance.functions.targetVault().call())
+
+    if target_vault == aave_pool:
+        logger.info("detect_protocol: %s is Aave (targetVault matches AAVE_POOL)", checksum_address)
+        return "aave"
+
+    logger.info("detect_protocol: %s is Euler (targetVault=%s)", checksum_address, target_vault)
     return "euler"

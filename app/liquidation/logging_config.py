@@ -5,6 +5,7 @@ Logging configuration for the liquidation bot.
 import logging
 import os
 import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,10 @@ class DetailedExceptionFormatter(logging.Formatter):
 
     def __init__(self) -> None:
         super().__init__()
-        self._detailed = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s\n%(exc_info)s")
+        # No %(exc_info)s placeholder — exc_text is set manually below and
+        # appended by the base Formatter, which avoids a literal "None" or
+        # double-traceback when exc_info is absent.
+        self._detailed = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         self._standard = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
     def format(self, record: logging.LogRecord) -> str:
@@ -42,7 +46,9 @@ def setup_logger() -> logging.Logger:
 
     console_handler = logging.StreamHandler()
     Path(LOGS_PATH).parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(LOGS_PATH, mode="a")
+    # Rotate at 100 MB, keep 5 backups so the volume-mounted logs dir never
+    # grows unboundedly while still retaining ~500 MB of recent history.
+    file_handler = RotatingFileHandler(LOGS_PATH, mode="a", maxBytes=100 * 1024 * 1024, backupCount=5)
 
     formatter = DetailedExceptionFormatter()
     console_handler.setFormatter(formatter)

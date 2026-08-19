@@ -13,9 +13,14 @@ liquidation = Blueprint("liquidation", __name__)
 
 
 def start_monitor(chain_ids=None):
-    """Start monitoring for specified chains, defaults to Base if none specified"""
+    """Start monitoring for specified chains.
+
+    chain_ids is always passed explicitly from create_app() which reads
+    MONITORED_CHAIN_IDS. The default here is kept only for test backward
+    compatibility — production always calls with an explicit list.
+    """
     if chain_ids is None:
-        chain_ids = [8453]
+        chain_ids = [1]
 
     chain_manager = ChainManager(chain_ids, notify=True)
 
@@ -34,8 +39,21 @@ def _get_chain_manager():
 
 @liquidation.route("/allPositions", methods=["GET"])
 def get_all_positions():
-    chain_id = int(request.args.get("chainId", 8453))
+    raw_chain_id = request.args.get("chainId")
     chain_manager = _get_chain_manager()
+
+    if raw_chain_id is None:
+        # Default to the first active chain rather than a hardcoded chain ID so
+        # the API stays consistent with whatever MONITORED_CHAIN_IDS is set to.
+        if chain_manager and chain_manager.monitors:
+            chain_id = next(iter(chain_manager.monitors))
+        else:
+            return jsonify({"error": "chainId query parameter required (no monitors initialised yet)"}), 400
+    else:
+        try:
+            chain_id = int(raw_chain_id)
+        except (ValueError, TypeError):
+            return jsonify({"error": f"Invalid chainId: {raw_chain_id!r} — must be a numeric value"}), 400
 
     if not chain_manager or chain_id not in chain_manager.monitors:
         return jsonify({"error": f"Monitor not initialized for chain {chain_id}"}), 500
@@ -45,7 +63,7 @@ def get_all_positions():
     sorted_accounts = monitor.get_accounts_by_health_score()
 
     response = []
-    for address, internal_hs, external_hs, balance, internal_borrowed, external_borrowed, symbol in sorted_accounts:
+    for address, internal_hs, external_hs, balance, internal_borrowed, external_borrowed, symbol, *_ in sorted_accounts:
         health_score = min(internal_hs, external_hs)
         if math.isinf(health_score):
             continue

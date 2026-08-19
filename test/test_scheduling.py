@@ -14,7 +14,7 @@ class MockVault(BaseCollateralVault):
 
     protocol = "mock"
 
-    def __init__(self, config):
+    def __init__(self, config, is_correlated: bool = False):
         # Skip the parent __init__ which calls _init_protocol_contracts
         self.config = config
         self.address = "0x" + "0" * 40
@@ -24,6 +24,9 @@ class MockVault(BaseCollateralVault):
         self.balance = 0
         self.internal_value_borrowed = 0
         self.external_value_borrowed = 0
+        self.underlying_asset_address = None
+        self.target_asset = None
+        self.is_correlated = is_correlated
         self.instance = MagicMock()
         self.instance.functions.isExternallyLiquidated.return_value.call.return_value = False
 
@@ -58,8 +61,7 @@ def test_empty_vault_scheduled_at_max_interval(config):
     expected_max = now + max_interval * 1.15
 
     assert expected_min < next_update < expected_max, (
-        f"Empty vault should be scheduled ~{max_interval}s from now, "
-        f"got {next_update - now}s"
+        f"Empty vault should be scheduled ~{max_interval}s from now, got {next_update - now}s"
     )
 
 
@@ -81,8 +83,7 @@ def test_vault_never_scheduled_more_than_max_interval(config):
 
     # Should never exceed max interval (with jitter margin)
     assert time_until_update <= max_interval * 1.15, (
-        f"Vault scheduled {time_until_update}s in future, "
-        f"exceeds max interval {max_interval}s"
+        f"Vault scheduled {time_until_update}s in future, exceeds max interval {max_interval}s"
     )
 
 
@@ -110,8 +111,7 @@ def test_high_risk_vault_scheduled_soon(config):
     safe_gap = safe_update - now
 
     assert high_risk_gap < safe_gap, (
-        f"High-risk vault should be scheduled sooner than safe vault. "
-        f"High-risk: {high_risk_gap}s, Safe: {safe_gap}s"
+        f"High-risk vault should be scheduled sooner than safe vault. High-risk: {high_risk_gap}s, Safe: {safe_gap}s"
     )
 
 
@@ -152,8 +152,8 @@ def test_liquidatable_vault_scheduled_very_soon(config):
 
     time_until_update = next_update - now
 
-    # For SMALL position ($1000), LIQ time is 15 seconds
-    # With 10% jitter, should be between ~13.5 and ~16.5 seconds
-    assert time_until_update < 20, (
-        f"Liquidatable vault should be scheduled within ~15s, got {time_until_update}s"
+    # Non-correlated CV at HF=0.99 falls in the LIQ bucket (60s) with ±10% jitter.
+    liq_interval = vault.config.cadence_uncorrelated["LIQ"]
+    assert time_until_update < liq_interval * 1.15, (
+        f"Liquidatable vault should be scheduled within ~{liq_interval}s, got {time_until_update}s"
     )

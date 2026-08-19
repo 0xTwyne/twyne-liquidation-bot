@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {TwyneAaveLiquidator, IAaveCollateralVault, IERC20} from "contracts/TwyneAaveLiquidator.sol";
+import {LiquidationStateBuilder} from "./LiquidationStateBuilder.sol";
 
 interface IAaveV3ATokenWrapper {
     function asset() external view returns (address);
@@ -20,7 +21,7 @@ interface ICollateralVaultFactory {
         uint8 _vaultType,
         address _asset,
         address _targetVault,
-        uint _liqLTV,
+        uint256 _liqLTV,
         address _targetAsset
     ) external returns (address);
     function paused() external view returns (bool);
@@ -37,8 +38,8 @@ interface IEVault {
 
 interface IEVC {
     struct BatchItem {
-        address onBehalfOfAccount;
         address targetContract;
+        address onBehalfOfAccount;
         uint256 value;
         bytes data;
     }
@@ -70,8 +71,11 @@ interface IAaveV3Pool {
         );
     function setUserEMode(uint8 categoryId) external;
     function setUserUseReserveAsCollateral(address asset, bool useAsCollateral) external;
-    function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf) external;
-    function repay(address asset, uint256 amount, uint256 interestRateMode, address onBehalfOf) external returns (uint256);
+    function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf)
+        external;
+    function repay(address asset, uint256 amount, uint256 interestRateMode, address onBehalfOf)
+        external
+        returns (uint256);
     function liquidationCall(
         address collateralAsset,
         address debtAsset,
@@ -81,25 +85,39 @@ interface IAaveV3Pool {
     ) external;
 }
 
-contract AaveLiquidatorTest is Test {
+contract AaveLiquidatorTest is LiquidationStateBuilder {
     TwyneAaveLiquidator liquidator;
     MockSwapper mockSwapper;
 
-    // Mainnet addresses
-    address constant AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
+    // AAVE_POOL / USDC / WETH are inherited from LiquidationStateBuilder.
     address constant MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
-    address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
-    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     address collateralVaultFactory;
     address twyneEVCAddress;
     address owner;
+    address borrower;
+
+    // Sizing for the manufactured Aave CV (wstETH collateral, WETH debt).
+    uint16 constant AAVE_LIQ_LTV = 9800; // == live maxTwyneLTVs(awstETH IV); > external eMode LT (9500) so the CV reserves credit
+    uint256 constant AAVE_COLLATERAL_WSTETH = 2 ether;
+    uint256 constant AAVE_BORROW_WETH = 1 ether;
+
+    event ExtLiqZeroDebt(
+        address indexed violatorAddress,
+        address repaidBorrowAsset,
+        address seizedCollateralAsset,
+        uint256 amountRepaid,
+        uint256 amountProfit
+    );
 
     function setUp() public {
-        owner = makeAddr("alice");
+        owner = makeAddr("twyneAaveLiqOwner");
+        borrower = makeAddr("twyneAaveLiqBorrower");
+        require(owner.code.length == 0 && borrower.code.length == 0, "test EOA collides with live contract");
         vm.deal(owner, 10 ether);
 
-        if (block.chainid == 1) { // mainnet
+        if (block.chainid == 1) {
+            // mainnet
             collateralVaultFactory = 0xa1517cCe0bE75700A8838EA1cEE0dc383cd3A332;
             twyneEVCAddress = 0xef39D6493884C4C84D38a4bFF879Ce16CEdE702a;
         } else {
@@ -133,115 +151,93 @@ contract AaveLiquidatorTest is Test {
         assertEq(address(liquidator.MORPHO()), MORPHO);
     }
 
-    /// @notice Test liquidating an AAVE collateral vault
-    /// @dev This test requires finding a liquidatable AAVE vault at a specific block
+    /// @notice Variant 4: Twyne-internal liquidation of an AAVE collateral vault.
+    /// @dev State is manufactured on the live protocol via the builder (DEV-569).
     function testLiquidateAaveVault() public {
-        // Fork at block where AAVE collateral vaults exist
-        // Note: You'll need to update this block number and vault address
-        // when actual AAVE vaults become liquidatable on mainnet
-        vm.rollFork(23600528);
-
+        _forkMainnet();
         deployLiquidator();
 
-        // Skip if no AAVE vaults are liquidatable at this block
-        // This serves as a template for when real liquidatable vaults exist
-        // TODO: Update with actual liquidatable AAVE vault address when available
-        address testVault = address(0); // Placeholder - update with real vault
+        CVHandles memory h = _createAaveCV(borrower, AAVE_LIQ_LTV, AAVE_COLLATERAL_WSTETH, AAVE_BORROW_WETH);
+        makeAaveInternallyLiquidatable(h);
 
-        if (testVault == address(0)) {
-            // Skip test if no vault to liquidate
-            return;
-        }
-
-        IAaveCollateralVault collateralVault = IAaveCollateralVault(testVault);
-        vm.label(address(collateralVault), "collateralVault");
-
-        // Verify it's a valid collateral vault
-        assertTrue(ICollateralVaultFactory(collateralVaultFactory).isCollateralVault(address(collateralVault)));
-
-        // Verify vault is liquidatable
+        IAaveCollateralVault collateralVault = IAaveCollateralVault(h.cv);
+        assertTrue(ICollateralVaultFactory(collateralVaultFactory).isCollateralVault(h.cv));
         assertTrue(collateralVault.canLiquidate(), "collateral vault cannot be liquidated!");
 
-        // Get tokens
         address wrapperToken = collateralVault.asset();
         address underlyingToken = IAaveV3ATokenWrapper(wrapperToken).asset();
         address targetAsset = collateralVault.targetAsset();
 
-        vm.label(wrapperToken, "wrapperToken");
-        vm.label(underlyingToken, "underlyingToken");
-        vm.label(targetAsset, "targetAsset");
-
-        // Setup swap
-        uint amountIn = IERC20(underlyingToken).balanceOf(address(collateralVault));
-        uint amountOut = collateralVault.maxRepay() + 1;
-
-        bytes memory dexData = abi.encodeCall(
-            MockSwapper.swap, (underlyingToken, targetAsset, amountIn, amountOut, address(liquidator))
-        );
+        uint256 amountIn = IERC20(underlyingToken).balanceOf(h.cv);
+        uint256 amountOut = collateralVault.maxRepay() + 1;
+        bytes memory dexData =
+            abi.encodeCall(MockSwapper.swap, (underlyingToken, targetAsset, amountIn, amountOut, address(liquidator)));
         deal(targetAsset, address(mockSwapper), amountOut);
 
-        // Calculate collateralFlashAmount - this should cover collateralForBorrower amount
-        // For testing, we use the underlying balance in the vault
-        uint collateralFlashAmount = IERC20(underlyingToken).balanceOf(address(collateralVault));
-
-        // Execute liquidation
-        uint initTargetAssetBal = IERC20(targetAsset).balanceOf(address(liquidator));
-        liquidator.liquidateCollateralVault(address(collateralVault), collateralFlashAmount, dexData, 1);
-        uint postTargetAssetBal = IERC20(targetAsset).balanceOf(address(liquidator));
+        uint256 initTargetAssetBal = IERC20(targetAsset).balanceOf(address(liquidator));
+        liquidator.liquidateCollateralVault(h.cv, dexData, 1);
+        uint256 postTargetAssetBal = IERC20(targetAsset).balanceOf(address(liquidator));
 
         assertGe(postTargetAssetBal - initTargetAssetBal, 1, "No profit from liquidation");
     }
 
-    /// @notice Test external liquidation handling with zero debt
+    /// @notice Variant 6: externally liquidated AAVE vault with all target debt cleared (zero debt).
     function testExternallyLiquidatedAaveVaultWithZeroDebt() public {
-        // Fork at appropriate block
-        vm.rollFork(23600528);
-
+        _forkMainnet();
         deployLiquidator();
 
-        // TODO: Update with actual externally liquidated AAVE vault when available
-        address testVault = address(0); // Placeholder
+        CVHandles memory h = _createAaveCV(borrower, AAVE_LIQ_LTV, AAVE_COLLATERAL_WSTETH, AAVE_BORROW_WETH);
+        makeAaveExternallyLiquidatedZeroDebt(h, makeAddr("aaveExtLiquidator"));
 
-        if (testVault == address(0)) {
-            return;
-        }
-
-        IAaveCollateralVault collateralVault = IAaveCollateralVault(testVault);
-        vm.label(address(collateralVault), "collateralVault");
-
+        IAaveCollateralVault collateralVault = IAaveCollateralVault(h.cv);
         assertTrue(collateralVault.isExternallyLiquidated(), "collateral vault was not externally liquidated!");
         assertNotEq(collateralVault.borrower(), address(0), "handleExternalLiquidation is yet to be called!");
         assertGt(collateralVault.maxRelease(), 0, "anyone can call handleExternalLiquidation!");
         assertEq(collateralVault.maxRepay(), 0, "collateral vault has 0 debt");
 
         IERC20 wrapperToken = IERC20(collateralVault.asset());
-        vm.label(address(wrapperToken), "wrapperToken");
-
-        uint initBal = wrapperToken.balanceOf(address(collateralVault));
+        uint256 initBal = wrapperToken.balanceOf(h.cv);
         assertGt(initBal, 0);
 
-        liquidator.liquidateExtLiquidatedCollateralVault(address(collateralVault), bytes(""), 0);
+        liquidator.liquidateExtLiquidatedCollateralVault(h.cv, bytes(""), 0);
 
-        assertEq(wrapperToken.balanceOf(address(collateralVault)), 0);
+        assertEq(wrapperToken.balanceOf(h.cv), 0);
     }
 
-    /// @notice Test external liquidation handling with remaining debt
-    function testExternallyLiquidatedAaveVaultWithDebt() public {
-        // Fork at appropriate block
-        vm.rollFork(23600528);
+    function testExternallyLiquidatedAaveZeroDebtEmitsAndClearsApprovalWithMocks() public {
+        MockAaveEVC mockEvc = new MockAaveEVC();
+        MockAaveCollateralVaultFactory mockFactory = new MockAaveCollateralVaultFactory(address(mockEvc));
+        MockAaveERC20 targetAsset = new MockAaveERC20();
+        MockAaveERC20 wrapperToken = new MockAaveERC20();
+        MockAaveERC20 underlyingAsset = new MockAaveERC20();
+        MockAaveIntermediateVault intermediateVault = new MockAaveIntermediateVault();
+        MockAaveCollateralVault collateralVault = new MockAaveCollateralVault(
+            address(targetAsset), address(wrapperToken), address(underlyingAsset), address(intermediateVault)
+        );
+        mockFactory.setCollateralVault(address(collateralVault), true);
 
+        MockSwapper testMockSwapper = new MockSwapper();
+        TwyneAaveLiquidator testLiquidator =
+            new TwyneAaveLiquidator(owner, address(mockFactory), address(testMockSwapper), makeAddr("aavePool"));
+
+        vm.expectEmit(true, false, false, false, address(testLiquidator));
+        emit ExtLiqZeroDebt(address(collateralVault), address(targetAsset), address(underlyingAsset), 0, 0);
+        testLiquidator.liquidateExtLiquidatedCollateralVault(address(collateralVault), bytes(""), 1);
+
+        assertTrue(collateralVault.handledExternalLiquidation(), "handleExternalLiquidation not called");
+        assertTrue(intermediateVault.liquidated(), "intermediate vault not liquidated");
+        assertEq(targetAsset.allowance(address(testLiquidator), address(collateralVault)), 0, "target allowance to CV");
+    }
+
+    /// @notice Variant 5: externally liquidated AAVE vault with residual target debt (maxRepay > 0).
+    function testExternallyLiquidatedAaveVaultWithDebt() public {
+        _forkMainnet();
         deployLiquidator();
 
-        // TODO: Update with actual externally liquidated AAVE vault with debt when available
-        address testVault = address(0); // Placeholder
+        CVHandles memory h = _createAaveCV(borrower, AAVE_LIQ_LTV, AAVE_COLLATERAL_WSTETH, AAVE_BORROW_WETH);
+        makeAaveExternallyLiquidatedWithDebt(h, makeAddr("aaveExtLiquidator"));
 
-        if (testVault == address(0)) {
-            return;
-        }
-
-        IAaveCollateralVault collateralVault = IAaveCollateralVault(testVault);
-        vm.label(address(collateralVault), "collateralVault");
-
+        IAaveCollateralVault collateralVault = IAaveCollateralVault(h.cv);
         assertTrue(collateralVault.isExternallyLiquidated(), "collateral vault was not externally liquidated!");
         assertGt(collateralVault.maxRepay(), 0, "collateral vault has 0 debt");
 
@@ -249,26 +245,19 @@ contract AaveLiquidatorTest is Test {
         address underlyingToken = IAaveV3ATokenWrapper(wrapperToken).asset();
         address targetAsset = collateralVault.targetAsset();
 
-        vm.label(wrapperToken, "wrapperToken");
-        vm.label(underlyingToken, "underlyingToken");
-        vm.label(targetAsset, "targetAsset");
-
-        // Setup swap
-        uint amountIn = IERC20(underlyingToken).balanceOf(address(liquidator));
-        uint amountOut = collateralVault.maxRepay() + 1;
-
-        bytes memory dexData = abi.encodeCall(
-            MockSwapper.swap, (underlyingToken, targetAsset, amountIn, amountOut, address(liquidator))
-        );
+        uint256 amountIn = IERC20(underlyingToken).balanceOf(address(liquidator));
+        uint256 amountOut = collateralVault.maxRepay() + 1;
+        bytes memory dexData =
+            abi.encodeCall(MockSwapper.swap, (underlyingToken, targetAsset, amountIn, amountOut, address(liquidator)));
         deal(targetAsset, address(mockSwapper), amountOut);
 
-        uint initTargetAssetLiquidatorBal = IERC20(targetAsset).balanceOf(address(liquidator));
-        liquidator.liquidateExtLiquidatedCollateralVault(address(collateralVault), dexData, 1);
+        uint256 initTargetAssetLiquidatorBal = IERC20(targetAsset).balanceOf(address(liquidator));
+        liquidator.liquidateExtLiquidatedCollateralVault(h.cv, dexData, 1);
 
-        assertEq(IERC20(wrapperToken).balanceOf(address(collateralVault)), 0);
+        assertEq(IERC20(wrapperToken).balanceOf(h.cv), 0);
         assertEq(collateralVault.maxRepay(), 0, "maxRepay not 0 after handleExternalLiquidation");
 
-        uint postTargetAssetLiquidatorBal = IERC20(targetAsset).balanceOf(address(liquidator));
+        uint256 postTargetAssetLiquidatorBal = IERC20(targetAsset).balanceOf(address(liquidator));
         assertGt(postTargetAssetLiquidatorBal, initTargetAssetLiquidatorBal);
     }
 
@@ -280,7 +269,7 @@ contract AaveLiquidatorTest is Test {
         // Deal some tokens to the liquidator
         deal(USDC, address(liquidator), 1000e6);
 
-        uint initOwnerBal = IERC20(USDC).balanceOf(owner);
+        uint256 initOwnerBal = IERC20(USDC).balanceOf(owner);
 
         // Non-owner cannot sweep
         vm.expectRevert(bytes("t1"));
@@ -303,12 +292,17 @@ contract AaveLiquidatorTest is Test {
         vm.deal(testOwner, 10 ether);
 
         MockSwapper testMockSwapper = new MockSwapper();
-        TwyneAaveLiquidator testLiquidator = new TwyneAaveLiquidator(testOwner, collateralVaultFactory, address(testMockSwapper), AAVE_POOL);
+        TwyneAaveLiquidator testLiquidator =
+            new TwyneAaveLiquidator(testOwner, collateralVaultFactory, address(testMockSwapper), AAVE_POOL);
 
         // Deal some ETH to the liquidator
         vm.deal(address(testLiquidator), 1 ether);
 
-        uint initOwnerBal = testOwner.balance;
+        uint256 initOwnerBal = testOwner.balance;
+
+        // Non-owner cannot sweep ETH
+        vm.expectRevert(bytes("t1"));
+        testLiquidator.sweepETH(1 ether);
 
         // Owner can sweep ETH
         vm.prank(testOwner);
@@ -316,6 +310,22 @@ contract AaveLiquidatorTest is Test {
 
         assertEq(address(testLiquidator).balance, 0);
         assertEq(testOwner.balance, initOwnerBal + 1 ether);
+    }
+
+    /// @notice Test sweepETH reverts when the owner rejects ETH
+    function testSweepETHRevertsWhenTransferFails() public {
+        vm.rollFork(23600528);
+
+        RevertingAaveETHReceiver rejectingOwner = new RevertingAaveETHReceiver();
+        MockSwapper testMockSwapper = new MockSwapper();
+        TwyneAaveLiquidator testLiquidator = new TwyneAaveLiquidator(
+            address(rejectingOwner), collateralVaultFactory, address(testMockSwapper), AAVE_POOL
+        );
+        vm.deal(address(testLiquidator), 1 ether);
+
+        vm.prank(address(rejectingOwner));
+        vm.expectRevert(bytes("ETH transfer failed"));
+        testLiquidator.sweepETH(1 ether);
     }
 
     /// @notice Test setRouter function
@@ -349,6 +359,120 @@ contract AaveLiquidatorTest is Test {
         address fakeVault = makeAddr("fakeVault");
 
         vm.expectRevert(bytes("The input address is not a Twyne collateral vault"));
-        liquidator.liquidateCollateralVault(fakeVault, 0, bytes(""), 0);
+        liquidator.liquidateCollateralVault(fakeVault, bytes(""), 0);
+    }
+}
+
+contract MockAaveERC20 {
+    mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => uint256) public balanceOf;
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+}
+
+contract MockAaveCollateralVaultFactory {
+    address public immutable EVC;
+    mapping(address => bool) public isCollateralVault;
+
+    constructor(address evc) {
+        EVC = evc;
+    }
+
+    function setCollateralVault(address collateralVault, bool valid) external {
+        isCollateralVault[collateralVault] = valid;
+    }
+}
+
+contract MockAaveEVC {
+    struct BatchItem {
+        address targetContract;
+        address onBehalfOfAccount;
+        uint256 value;
+        bytes data;
+    }
+
+    function enableController(address, address) external {}
+
+    function batch(BatchItem[] calldata items) external {
+        for (uint256 i = 0; i < items.length; i++) {
+            (bool success, bytes memory data) = items[i].targetContract.call{value: items[i].value}(items[i].data);
+            if (!success) {
+                assembly {
+                    revert(add(32, data), mload(data))
+                }
+            }
+        }
+    }
+}
+
+contract MockAaveIntermediateVault {
+    bool public liquidated;
+
+    function liquidate(address, address, uint256, uint256) external {
+        liquidated = true;
+    }
+}
+
+contract MockAaveCollateralVault {
+    address public immutable targetAsset;
+    address public immutable asset;
+    address public immutable underlyingAsset;
+    address public immutable intermediateVault;
+    bool public handledExternalLiquidation;
+
+    constructor(address targetAsset_, address asset_, address underlyingAsset_, address intermediateVault_) {
+        targetAsset = targetAsset_;
+        asset = asset_;
+        underlyingAsset = underlyingAsset_;
+        intermediateVault = intermediateVault_;
+    }
+
+    function canLiquidate() external pure returns (bool) {
+        return false;
+    }
+
+    function isExternallyLiquidated() external pure returns (bool) {
+        return true;
+    }
+
+    function maxRepay() external pure returns (uint256) {
+        return 0;
+    }
+
+    function maxRelease() external pure returns (uint256) {
+        return 1;
+    }
+
+    function borrower() external pure returns (address) {
+        return address(0x1234);
+    }
+
+    function targetVault() external pure returns (address) {
+        return address(0);
+    }
+
+    function totalAssetsDepositedOrReserved() external pure returns (uint256) {
+        return 1;
+    }
+
+    function handleExternalLiquidation() external {
+        handledExternalLiquidation = true;
+    }
+
+    function liquidate() external {}
+    function repay(uint256) external {}
+    function withdraw(uint256, address) external {}
+
+    function redeemUnderlying(uint256, address) external pure returns (uint256) {
+        return 0;
+    }
+}
+
+contract RevertingAaveETHReceiver {
+    receive() external payable {
+        revert("reject ETH");
     }
 }

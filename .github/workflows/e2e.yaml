@@ -1,0 +1,41 @@
+# Layer-3 end-to-end fork tests (DEV-579).
+#
+# Drives the real Python bot against a local anvil mainnet fork seeded with
+# liquidatable Collateral Vaults (all 6 variants) and asserts on-chain liquidation.
+# Gated/optional: needs anvil + an AUTHENTICATED archive RPC (secrets.MAINNET_RPC_URL).
+# The public free-tier archive endpoints rate-limit the full suite's cumulative load,
+# so this job is skipped (not failed) when the secret is absent (e.g. external forks).
+name: e2e fork tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-22.04
+    env:
+      # Authenticated archive RPC. Empty on external forks -> the e2e step is skipped.
+      E2E_FORK_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+      FOUNDRY_ETH_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Install Foundry (forge + anvil)
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
+      - name: Forge build (e2e needs out/ artifacts)
+        run: forge build
+      - name: Install packages
+        run: uv sync --frozen
+      - name: Run e2e fork tests
+        if: env.E2E_FORK_RPC_URL != ''
+        run: uv run pytest test/e2e -m e2e -p no:cacheprovider

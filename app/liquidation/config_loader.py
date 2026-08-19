@@ -4,15 +4,29 @@ Config Loader module - part of multi chain refactor
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
+import requests
 import yaml
+from requests.adapters import HTTPAdapter
 from web3 import Web3
+
+# Worker count for the AccountMonitor thread pool (P4 / DEV-555).
+# Overridable at deploy time via the MONITOR_WORKER_COUNT env var.
+# The default of 32 is preserved for backward compatibility; operators
+# running against rate-limited providers should lower this to match their
+# request-per-second budget.
+MONITOR_WORKER_COUNT: int = int(os.environ.get("MONITOR_WORKER_COUNT", "32"))
 
 
 class Web3Singleton:
     """
-    Singleton class to manage w3 object creation per RPC URL
+    Singleton class to manage w3 object creation per RPC URL.
+
+    Each instance is created with a requests Session whose HTTPAdapter is
+    sized to ``MONITOR_WORKER_COUNT`` connections so that concurrent worker
+    threads never queue on the default 10-connection pool or hammer the
+    provider into 429s (P4 / DEV-555).
     """
 
     _instances = {}
@@ -25,7 +39,19 @@ class Web3Singleton:
         """
 
         if rpc_url not in Web3Singleton._instances:
-            Web3Singleton._instances[rpc_url] = Web3(Web3.HTTPProvider(rpc_url))
+            session = requests.Session()
+            # Size the connection pool to at least MONITOR_WORKER_COUNT so that
+            # all worker threads can hold an open connection simultaneously.
+            # pool_connections controls how many distinct host:port pools to keep;
+            # pool_maxsize controls how many connections per pool.  Both are set
+            # to MONITOR_WORKER_COUNT (one RPC host, many concurrent callers).
+            adapter = HTTPAdapter(
+                pool_connections=MONITOR_WORKER_COUNT,
+                pool_maxsize=MONITOR_WORKER_COUNT,
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            Web3Singleton._instances[rpc_url] = Web3(Web3.HTTPProvider(rpc_url, session=session))
 
         return Web3Singleton._instances[rpc_url]
 
@@ -53,8 +79,11 @@ class ChainConfig:
         "LIQUIDATOR_PRIVATE_KEY",
         "ONEINCH_API_KEY",
         "RISK_DASHBOARD_URL",
-        "BASE_RPC_URL",
         # "NOTIFICATION_URL",  # Optional
+        # Chain-specific RPC URLs (e.g. MAINNET_RPC_URL, BASE_RPC_URL) are
+        # validated per-chain in __init__ via the RPC_NAME config key — they
+        # are intentionally NOT listed here so that only the chains actually
+        # started require their RPC URL to be set.
     ]
 
     def __init__(self, chain_id: int, global_config: Dict[str, Any], chain_config: Dict[str, Any]):
@@ -80,14 +109,28 @@ class ChainConfig:
         self.TWYNE_EOA_VAULTS = [s.strip() for s in eoa_vaults_raw.split(",") if s.strip()]
 
         # Load chain-specific RPC from env using RPC_NAME from config
-        self.RPC_URL = os.environ[self._chain["RPC_NAME"]]
+        rpc_var = self._chain["RPC_NAME"]
+        self.RPC_URL = os.environ.get(rpc_var)
         if not self.RPC_URL:
-            raise ValueError(f"Missing RPC URL for {self._chain['name']}. Env var {self._chain['RPC_NAME']} not found")
+            raise ValueError(f"Missing RPC URL for {self._chain['name']}. Env var {rpc_var} not set")
 
         self.w3 = setup_w3(self.RPC_URL)
         self.mainnet_w3 = setup_w3(os.environ.get("MAINNET_RPC_URL", self.RPC_URL))
 
-        # Set chain-specific paths
+        # Cadence configuration: two step-function bucket tables (correlated vs
+        # uncorrelated) plus the per-chain whitelist of correlated (collateral,
+        # debt) pairs. Addresses are normalised to checksum form so membership
+        # checks are case-insensitive.
+        self.cadence_correlated: Dict[str, int] = dict(global_config["cadence_correlated"])
+        self.cadence_uncorrelated: Dict[str, int] = dict(global_config["cadence_uncorrelated"])
+        self.correlated_pairs: FrozenSet[Tuple[str, str]] = _parse_correlated_pairs(
+            chain_config.get("correlated_pairs") or []
+        )
+
+        # Set chain-specific paths.
+        # Note: LOGS_PATH in global config is the log directory (e.g. "logs");
+        # the chain-specific log file path below is currently unused — logging is
+        # configured via the LOGS_PATH environment variable in logging_config.py.
         self.LOGS_PATH = f"{self._global['LOGS_PATH']}/{self._chain['name']}_monitor.log"
         self.SAVE_STATE_PATH = f"{self._global['SAVE_STATE_PATH']}/{self._chain['name']}_state.json"
 
@@ -112,21 +155,43 @@ class ChainConfig:
 
         self.WETH = self.w3.eth.contract(address=self.WETH, abi=abi)
 
+        # Swap-provider selection + liquidator-address overrides (DEV-579 e2e).
+        # Defaults preserve production behavior. On an anvil fork the harness sets
+        # SWAP_PROVIDER=mock and points EULER/AAVE_LIQUIDATOR_OVERRIDE at freshly
+        # deployed liquidators whose on-chain `router` is the mock swapper. These are
+        # set as instance attributes so they shadow the __getattr__ contracts lookup,
+        # which means the swap recipient used in the liquidation path is overridden too.
+        self.SWAP_PROVIDER = os.environ.get("SWAP_PROVIDER", "1inch")
+        self.EULER_LIQUIDATOR_ADDRESS = Web3.to_checksum_address(
+            os.environ.get("EULER_LIQUIDATOR_OVERRIDE") or self.EULER_LIQUIDATOR_ADDRESS
+        )
+        self.AAVE_LIQUIDATOR_ADDRESS = Web3.to_checksum_address(
+            os.environ.get("AAVE_LIQUIDATOR_OVERRIDE") or self.AAVE_LIQUIDATOR_ADDRESS
+        )
+        # Optional deployment-block override (e2e: narrows the FactoryListener startup
+        # scan to the fork's post-base blocks so only the seeded CV is discovered).
+        _dep_override = os.environ.get("CVAULT_FACTORY_DEPLOYMENT_BLOCK_OVERRIDE")
+        if _dep_override:
+            self.CVAULT_FACTORY_DEPLOYMENT_BLOCK = int(_dep_override)
+
         with open(self._global["LIQUIDATOR_CONTRACT_ABI_PATH"], "r", encoding="utf-8") as file:
             interface = json.load(file)
         euler_abi = interface["abi"]
 
-        self.euler_liqbot = self.w3.eth.contract(address=Web3.to_checksum_address(self.EULER_LIQUIDATOR_ADDRESS), abi=euler_abi)
+        self.euler_liqbot = self.w3.eth.contract(address=self.EULER_LIQUIDATOR_ADDRESS, abi=euler_abi)
 
         with open(self._global["AAVE_LIQUIDATOR_ABI_PATH"], "r", encoding="utf-8") as file:
             interface = json.load(file)
         aave_abi = interface["abi"]
 
-        self.aave_liqbot = self.w3.eth.contract(address=Web3.to_checksum_address(self.AAVE_LIQUIDATOR_ADDRESS), abi=aave_abi)
-
+        self.aave_liqbot = self.w3.eth.contract(address=self.AAVE_LIQUIDATOR_ADDRESS, abi=aave_abi)
 
     def __getattr__(self, name: str) -> Any:
         """Look up config values in chain-specific, then contracts, then global config."""
+        # Guard against recursion during pickling / copy / deepcopy when
+        # __init__ hasn't yet assigned _chain / _global.
+        if name.startswith("_"):
+            raise AttributeError(name)
         if name in self._chain:
             return self._chain[name]
         if name in self._chain.get("contracts", {}):
@@ -143,6 +208,19 @@ class ChainConfig:
         missing_keys = [key for key in self.required_env_vars if not os.getenv(key)]
         if missing_keys:
             raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_keys)}")
+
+
+def _parse_correlated_pairs(raw_pairs) -> FrozenSet[Tuple[str, str]]:
+    """
+    Convert a list of {collateral, debt} mappings into a frozenset of
+    (checksum_collateral, checksum_debt) tuples for fast membership checks.
+    """
+    pairs = set()
+    for entry in raw_pairs:
+        collateral = Web3.to_checksum_address(entry["collateral"])
+        debt = Web3.to_checksum_address(entry["debt"])
+        pairs.add((collateral, debt))
+    return frozenset(pairs)
 
 
 def load_chain_config(chain_id: int) -> ChainConfig:

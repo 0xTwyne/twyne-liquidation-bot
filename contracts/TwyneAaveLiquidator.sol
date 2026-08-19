@@ -16,32 +16,24 @@ interface ICollateralVaultFactory {
 interface IAaveCollateralVault {
     function canLiquidate() external view returns (bool);
     function liquidate() external;
-    function repay(uint amount) external;
-    function redeemUnderlying(uint assets, address receiver) external returns (uint);
+    function repay(uint256 amount) external;
+    function withdraw(uint256 assets, address receiver) external;
+    function redeemUnderlying(uint256 assets, address receiver) external returns (uint256);
     function handleExternalLiquidation() external;
     function isExternallyLiquidated() external view returns (bool);
-    function maxRepay() external view returns (uint);
-    function maxRelease() external view returns (uint);
+    function maxRepay() external view returns (uint256);
+    function maxRelease() external view returns (uint256);
     function targetAsset() external view returns (address);
     function targetVault() external view returns (address);
     function asset() external view returns (address);
     function underlyingAsset() external view returns (address);
     function intermediateVault() external view returns (address);
     function borrower() external view returns (address);
-    function totalAssetsDepositedOrReserved() external view returns (uint);
-    function collateralForBorrower(uint B, uint C) external view returns (uint);
+    function totalAssetsDepositedOrReserved() external view returns (uint256);
 }
 
 interface IAaveV3Pool {
     function withdraw(address asset, uint256 amount, address to) external returns (uint256);
-    function getUserAccountData(address user) external view returns (
-        uint256 totalCollateralBase,
-        uint256 totalDebtBase,
-        uint256 availableBorrowsBase,
-        uint256 currentLiquidationThreshold,
-        uint256 ltv,
-        uint256 healthFactor
-    );
 }
 
 interface IEVault {
@@ -50,28 +42,11 @@ interface IEVault {
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256);
 }
 
-/// @dev Interface for wrapped aToken that allows depositing underlying
-interface IWrappedAToken {
-    function deposit(uint256 assets, address receiver) external returns (uint256);
-    function mint(uint256 shares, address receiver) external returns (uint256);
-    function asset() external view returns (address);
-    function latestAnswer() external view returns (int256);
-    function decimals() external view returns (uint8);
-}
-
 /// @title TwyneAaveLiquidator
 /// @notice Liquidation contract for Twyne protocol AAVE V3 collateral vaults
 /// @dev Uses Morpho Blue flashloans for capital-efficient liquidations
 contract TwyneAaveLiquidator {
     error Swapper_EmptyError();
-
-    /// @dev Internal liquidation params to avoid stack too deep
-    struct InternalLiqParams {
-        address collateralVault;
-        address underlyingAsset;
-        uint collateralFlashAmount;
-        bytes dexData;
-    }
 
     address public immutable owner;
 
@@ -89,7 +64,10 @@ contract TwyneAaveLiquidator {
     error LessThanExpectedCollateralReceived();
 
     constructor(address _owner, address _factory, address _router, address _aavePool) {
-        require(_owner != address(0) && _factory != address(0) && _router != address(0) && _aavePool != address(0), "zero address");
+        require(
+            _owner != address(0) && _factory != address(0) && _router != address(0) && _aavePool != address(0),
+            "zero address"
+        );
         owner = _owner;
         factory = ICollateralVaultFactory(_factory);
         router = _router;
@@ -128,80 +106,47 @@ contract TwyneAaveLiquidator {
     );
 
     /// @notice Function for liquidating a Twyne AAVE collateral vault
-    /// @dev Uses nested flash loans:
-    ///      1. Flash loan target asset (for repaying vault debt)
-    ///      2. Inside callback: Flash loan underlying, deposit to get wrapped aTokens
-    ///      3. Liquidate (transfers wrapped aTokens to borrower, we become new owner)
-    ///      4. Repay vault debt with target asset
-    ///      5. Redeem underlying from vault
-    ///      6. Swap underlying → target asset (profit)
-    ///      7. Repay both flash loans
     /// @param collateralVault The address of the collateral vault to liquidate
-    /// @param collateralFlashAmount Amount of underlying collateral to flash loan (must cover collateralForBorrower amount)
-    /// @param dexData Encoded swap data to swap underlying → target asset (for profit after repaying flash loan)
+    /// @param dexData Encoded swap data for 1inch router
     /// @param minProfit Minimum profit required for the liquidation to succeed
     /// @return profit The profit from the liquidation
-    function liquidateCollateralVault(
-        address collateralVault,
-        uint collateralFlashAmount,
-        bytes calldata dexData,
-        uint minProfit
-    ) external payable returns (uint profit) {
+    function liquidateCollateralVault(address collateralVault, bytes calldata dexData, uint256 minProfit)
+        external
+        payable
+        returns (uint256 profit)
+    {
         // Verify collateralVault address is actually a collateral vault that can be liquidated
         require(factory.isCollateralVault(collateralVault), "The input address is not a Twyne collateral vault");
         require(IAaveCollateralVault(collateralVault).canLiquidate(), "Collateral vault cannot be liquidated");
 
         // Cache useful values
         address targetAsset = IAaveCollateralVault(collateralVault).targetAsset();
-        uint initBalance = IERC20(targetAsset).balanceOf(address(this));
-        uint maxRepay = IAaveCollateralVault(collateralVault).maxRepay();
+        uint256 initBalance = IERC20(targetAsset).balanceOf(address(this));
+        uint256 maxRepay = IAaveCollateralVault(collateralVault).maxRepay();
         address collateralAsset = IAaveCollateralVault(collateralVault).asset(); // wrapped aToken
         address underlyingAsset = IAaveCollateralVault(collateralVault).underlyingAsset();
 
         // Step 1: Perform all approvals for this tx
-        _approveInternalLiq(targetAsset, collateralAsset, underlyingAsset, collateralVault);
+        _safeApprove(targetAsset, collateralVault, type(uint256).max); // needed for repaying debt
+        _safeApprove(targetAsset, address(MORPHO), type(uint256).max); // needed for returning flashloan
+        _safeApprove(collateralAsset, collateralVault, type(uint256).max); // needed for deferred borrower payout in checkVaultStatus
+        _safeApprove(underlyingAsset, router, type(uint256).max); // needed for 1inch swap
 
-        // Step 2: Flash loan the target asset first (for repaying vault debt)
-        // Inside the callback, we'll do a nested flash loan of the underlying
-        // callbackType=0 for internal liquidation outer callback
-        {
-            InternalLiqParams memory params = InternalLiqParams({
-                collateralVault: collateralVault,
-                underlyingAsset: underlyingAsset,
-                collateralFlashAmount: collateralFlashAmount,
-                dexData: dexData
-            });
-            MORPHO.flashLoan(targetAsset, maxRepay, abi.encode(uint8(0), params));
-        }
+        // Step 2: Borrow target asset with flashloan
+        MORPHO.flashLoan(targetAsset, maxRepay, abi.encode(collateralVault, dexData, true));
         // Logic continues in onMorphoFlashLoan()
 
-        // Step 8: Verify the profit exceeds the minimum
-        profit = IERC20(targetAsset).balanceOf(address(this)) - initBalance;
+        // Step 6: Verify the profit exceeds the minimum
+        uint256 postBalance = IERC20(targetAsset).balanceOf(address(this));
+        profit = postBalance - initBalance;
         require(profit >= minProfit, "Liquidation is not sufficiently profitable");
 
         // For safety reasons, reset all approvals to zero
-        _resetApprovalsInternalLiq(targetAsset, collateralAsset, underlyingAsset, collateralVault);
-        emit Liquidation(collateralVault, targetAsset, underlyingAsset, maxRepay, profit);
-    }
-
-    /// @dev Helper to set approvals for internal liquidation
-    function _approveInternalLiq(address targetAsset, address collateralAsset, address underlyingAsset, address collateralVault) internal {
-        _safeApprove(targetAsset, collateralVault, type(uint).max); // needed for repaying debt
-        _safeApprove(targetAsset, address(MORPHO), type(uint).max); // needed for returning target asset flashloan
-        _safeApprove(underlyingAsset, address(MORPHO), type(uint).max); // needed for returning underlying flashloan
-        _safeApprove(underlyingAsset, collateralAsset, type(uint).max); // needed for depositing into wrapped aToken
-        _safeApprove(underlyingAsset, router, type(uint).max); // needed for 1inch swap
-        _safeApprove(collateralAsset, collateralVault, type(uint).max); // needed for liquidate() to transfer collateral to borrower
-    }
-
-    /// @dev Helper to reset approvals for internal liquidation
-    function _resetApprovalsInternalLiq(address targetAsset, address collateralAsset, address underlyingAsset, address collateralVault) internal {
         _safeApprove(targetAsset, collateralVault, 0);
         _safeApprove(targetAsset, address(MORPHO), 0);
-        _safeApprove(underlyingAsset, address(MORPHO), 0);
-        _safeApprove(underlyingAsset, collateralAsset, 0);
-        _safeApprove(underlyingAsset, router, 0);
         _safeApprove(collateralAsset, collateralVault, 0);
+        _safeApprove(underlyingAsset, router, 0);
+        emit Liquidation(collateralVault, targetAsset, underlyingAsset, maxRepay, profit);
     }
 
     /// @notice Function for handling the external liquidation of a Twyne AAVE collateral vault
@@ -209,10 +154,16 @@ contract TwyneAaveLiquidator {
     /// @param dexData Encoded swap data for 1inch router
     /// @param minProfit Minimum profit required
     /// @return profit The profit from handling the external liquidation
-    function liquidateExtLiquidatedCollateralVault(address collateralVault, bytes calldata dexData, uint minProfit) external returns (uint profit) {
+    function liquidateExtLiquidatedCollateralVault(address collateralVault, bytes calldata dexData, uint256 minProfit)
+        external
+        returns (uint256 profit)
+    {
         // Verify collateralVault address is actually a collateral vault that was externally liquidated
         require(factory.isCollateralVault(collateralVault), "The input address is not a Twyne collateral vault");
-        require(IAaveCollateralVault(collateralVault).isExternallyLiquidated(), "Collateral vault was not externally liquidated");
+        require(
+            IAaveCollateralVault(collateralVault).isExternallyLiquidated(),
+            "Collateral vault was not externally liquidated"
+        );
         if (IAaveCollateralVault(collateralVault).maxRepay() > 0) {
             return liquidateExtLiquidatedCollateralVaultWithDebt(collateralVault, dexData, minProfit);
         } else {
@@ -221,28 +172,31 @@ contract TwyneAaveLiquidator {
     }
 
     /// @notice Internal function for handling external liquidation when debt remains
-    function liquidateExtLiquidatedCollateralVaultWithDebt(address collateralVault, bytes calldata dexData, uint minProfit) internal returns (uint profit) {
+    function liquidateExtLiquidatedCollateralVaultWithDebt(
+        address collateralVault,
+        bytes calldata dexData,
+        uint256 minProfit
+    ) internal returns (uint256 profit) {
         // Enable controller to enable liquidation on intermediate vault
         evc.enableController(address(this), IAaveCollateralVault(collateralVault).intermediateVault());
 
         // Cache useful values
         address targetAsset = IAaveCollateralVault(collateralVault).targetAsset();
-        uint initBalance = IERC20(targetAsset).balanceOf(address(this));
-        uint maxRepay = IAaveCollateralVault(collateralVault).maxRepay();
+        uint256 initBalance = IERC20(targetAsset).balanceOf(address(this));
+        uint256 maxRepay = IAaveCollateralVault(collateralVault).maxRepay();
         address underlyingAsset = IAaveCollateralVault(collateralVault).underlyingAsset();
 
         // Step 1: Perform all approvals for this tx
-        _safeApprove(targetAsset, collateralVault, type(uint).max); // needed for repaying debt in handleExternalLiquidation
-        _safeApprove(targetAsset, address(MORPHO), type(uint).max); // needed for returning flashloan
+        _safeApprove(targetAsset, collateralVault, type(uint256).max); // needed for repaying debt in handleExternalLiquidation
+        _safeApprove(targetAsset, address(MORPHO), type(uint256).max); // needed for returning flashloan
         _safeApprove(underlyingAsset, router, type(uint256).max); // needed for 1inch swap
 
         // Step 2: Borrow target asset with flashloan
-        // callbackType=2 for external liquidation callback
-        MORPHO.flashLoan(targetAsset, maxRepay, abi.encode(uint8(2), collateralVault, dexData));
+        MORPHO.flashLoan(targetAsset, maxRepay, abi.encode(collateralVault, dexData, false));
         // Logic continues in onMorphoFlashLoan()
 
         // Step 6: Verify the profit exceeds the minimum
-        uint postBalance = IERC20(targetAsset).balanceOf(address(this));
+        uint256 postBalance = IERC20(targetAsset).balanceOf(address(this));
         profit = postBalance - initBalance;
         require(profit >= minProfit, "Liquidation is not sufficiently profitable");
 
@@ -254,18 +208,18 @@ contract TwyneAaveLiquidator {
     }
 
     /// @notice Internal function for handling external liquidation when no debt remains
-    function liquidateExtLiquidatedCollateralVaultZeroDebt(address collateralVault) internal returns (uint profit) {
+    function liquidateExtLiquidatedCollateralVaultZeroDebt(address collateralVault) internal returns (uint256 profit) {
         // Enable controller to enable liquidation on intermediate vault
         address intermediateVault = IAaveCollateralVault(collateralVault).intermediateVault();
         evc.enableController(address(this), intermediateVault);
 
         // Cache useful values
         address targetAsset = IAaveCollateralVault(collateralVault).targetAsset();
-        uint maxRepay = IAaveCollateralVault(collateralVault).maxRepay();
+        uint256 maxRepay = IAaveCollateralVault(collateralVault).maxRepay();
         address underlyingAsset = IAaveCollateralVault(collateralVault).underlyingAsset();
 
         // Step 1: Perform all approvals for this tx
-        _safeApprove(targetAsset, collateralVault, type(uint).max); // needed for repaying debt in handleExternalLiquidation
+        _safeApprove(targetAsset, collateralVault, type(uint256).max); // needed for repaying debt in handleExternalLiquidation
 
         // Create batch to perform necessary steps to close out this position
         // For zero debt case, just call handleExternalLiquidation then liquidate intermediate vault bad debt
@@ -284,60 +238,26 @@ contract TwyneAaveLiquidator {
         });
         evc.batch(items);
 
+        _safeApprove(targetAsset, collateralVault, 0);
         emit ExtLiqZeroDebt(collateralVault, targetAsset, underlyingAsset, maxRepay, profit);
     }
 
-    /// @notice Morpho flashloan callback - handles both internal liquidation (nested) and external liquidation
-    /// @dev Callback types determined by `callbackType`:
-    ///      0 = Internal liquidation OUTER callback (target asset) - triggers nested flash loan
-    ///      1 = Internal liquidation INNER callback (underlying) - executes liquidation
-    ///      2 = External liquidation callback (target asset) - handles external liquidation
-    function onMorphoFlashLoan(uint amount, bytes calldata data) external {
+    /// @notice Morpho flashloan callback
+    /// @param data Encoded callback data containing collateral vault address, dex data, and isInternal flag
+    function onMorphoFlashLoan(
+        uint256,
+        /*amount*/
+        bytes calldata data
+    )
+        external
+    {
         require(msg.sender == address(MORPHO), "This function should only be called by Morpho during a flashloan");
+        (address collateralVault, bytes memory dexData, bool isInternal) = abi.decode(data, (address, bytes, bool));
 
-        // First decode the callback type
-        uint8 callbackType = abi.decode(data, (uint8));
-
-        if (callbackType == 0) {
-            // Internal liquidation OUTER callback (target asset flash loan)
-            (, InternalLiqParams memory params) = abi.decode(data, (uint8, InternalLiqParams));
-
-            // Step 3: Trigger nested flash loan for underlying collateral
-            // Pass callbackType=1 for inner callback
-            MORPHO.flashLoan(params.underlyingAsset, params.collateralFlashAmount, abi.encode(uint8(1), params.collateralVault, params.dexData));
-            // After nested callback completes, target asset flash loan will be repaid
-
-        } else if (callbackType == 1) {
-            // Internal liquidation INNER callback (underlying flash loan)
-            (, address collateralVault, bytes memory dexData) = abi.decode(data, (uint8, address, bytes));
-
-            address collateralAsset = IAaveCollateralVault(collateralVault).asset(); // wrapped aToken
-
-            // Step 4: Calculate cForB and deposit the required amount
-            // For Aave: B = totalDebtBase (8 decimals USD), C = userOwnedCollateral * latestAnswer / 10^decimals
-            uint cForB;
-            {
-                address _aavePool = IAaveCollateralVault(collateralVault).targetVault();
-                (, uint totalDebtBase,,,,) = IAaveV3Pool(_aavePool).getUserAccountData(collateralVault);
-
-                uint totalAssets = IAaveCollateralVault(collateralVault).totalAssetsDepositedOrReserved();
-                uint maxRelease = IAaveCollateralVault(collateralVault).maxRelease();
-                uint userOwnedCollateral = totalAssets - maxRelease;
-
-                // Get price from wrapper's latestAnswer (Chainlink oracle, 8 decimals)
-                int256 latestAnswer = IWrappedAToken(collateralAsset).latestAnswer();
-                uint8 decimals = IWrappedAToken(collateralAsset).decimals();
-                uint C = userOwnedCollateral * uint(latestAnswer) / (10 ** decimals);
-
-                // Get collateralForBorrower - returns amount in wrapper shares (same decimals as wrapper)
-                cForB = IAaveCollateralVault(collateralVault).collateralForBorrower(totalDebtBase, C);
-            }
-
-            // Mint exactly cForB wrapper shares (uses underlying from flash loan)
-            // This is equivalent to Euler's mint(cForB) pattern
-            IWrappedAToken(collateralAsset).mint(cForB, address(this));
-
-            // Step 5: Use EVC batch to: liquidate → repay → redeem
+        // Step 3: Branching logic depending on whether the vault is liquidatable or was externally liquidated
+        if (isInternal) {
+            // Standard liquidation flow for AAVE collateral vaults
+            // Use EVC batch to: liquidate vault → repay debt → redeem underlying
             IEVC.BatchItem[] memory items = new IEVC.BatchItem[](3);
             items[0] = IEVC.BatchItem({
                 onBehalfOfAccount: address(this),
@@ -349,34 +269,24 @@ contract TwyneAaveLiquidator {
                 onBehalfOfAccount: address(this),
                 targetContract: collateralVault,
                 value: 0,
-                data: abi.encodeCall(IAaveCollateralVault(collateralVault).repay, (type(uint).max))
+                data: abi.encodeCall(IAaveCollateralVault(collateralVault).repay, (type(uint256).max))
             });
             items[2] = IEVC.BatchItem({
                 onBehalfOfAccount: address(this),
                 targetContract: collateralVault,
                 value: 0,
-                data: abi.encodeCall(IAaveCollateralVault(collateralVault).redeemUnderlying, (type(uint).max, address(this)))
+                data: abi.encodeCall(IAaveCollateralVault(collateralVault).withdraw, (type(uint256).max, address(this)))
             });
             evc.batch(items);
 
-            // Step 6: Swap underlying → target asset for profit
-            if (dexData.length > 0) {
-                (bool isSuccess, bytes memory returnData) = router.call(dexData);
-                if (!isSuccess) {
-                    if (returnData.length > 0) {
-                        assembly {
-                            revert(add(32, returnData), mload(returnData))
-                        }
-                    }
-                    revert Swapper_EmptyError();
-                }
+            // After batch: we hold remaining wrapper shares (deferred borrower payout already pulled).
+            // Redeem all remaining wrapper shares for underlying.
+            address collateralAsset = IAaveCollateralVault(collateralVault).asset();
+            uint256 wrapperBalance = IERC20(collateralAsset).balanceOf(address(this));
+            if (wrapperBalance > 0) {
+                IEVault(collateralAsset).redeem(wrapperBalance, address(this), address(this));
             }
-            // Inner flash loan (underlying) will be repaid when this callback ends
-
-        } else if (callbackType == 2) {
-            // External liquidation callback (target asset flash loan)
-            (, address collateralVault, bytes memory dexData) = abi.decode(data, (uint8, address, bytes));
-
+        } else {
             // External liquidation flow - vault was liquidated by Aave
             address intermediateVault = IAaveCollateralVault(collateralVault).intermediateVault();
 
@@ -396,31 +306,31 @@ contract TwyneAaveLiquidator {
             evc.batch(items);
 
             // Redeem aTokens received for underlying asset from Aave pool
-            aavePool.withdraw(IAaveCollateralVault(collateralVault).underlyingAsset(), type(uint).max, address(this));
-
-            // Swap underlying to target asset to repay flash loan
-            if (dexData.length > 0) {
-                (bool isSuccess, bytes memory returnData) = router.call(dexData);
-                if (!isSuccess) {
-                    if (returnData.length > 0) {
-                        assembly {
-                            revert(add(32, returnData), mload(returnData))
-                        }
-                    }
-                    revert Swapper_EmptyError();
-                }
-            }
+            // handleExternalLiquidation sends aTokens directly via redeemATokens
+            aavePool.withdraw(IAaveCollateralVault(collateralVault).underlyingAsset(), type(uint256).max, address(this));
         }
 
-        // Flash loan will be repaid via transferFrom when callback ends
+        // Step 4: Use 1inch to swap the underlying asset back to the target asset (flashloaned asset)
+        (bool isSuccess, bytes memory returnData) = router.call(dexData);
+        if (!isSuccess) {
+            if (returnData.length > 0) {
+                assembly {
+                    revert(add(32, returnData), mload(returnData))
+                }
+            }
+            revert Swapper_EmptyError();
+        }
+
+        // Step 5: When the callback ends, Morpho does transferFrom to return the flashloaned assets
     }
 
-    function sweep(address token, uint amount) external onlyOwner {
+    function sweep(address token, uint256 amount) external onlyOwner {
         _safeTransfer(token, msg.sender, amount);
     }
 
-    function sweepETH(uint amount) external onlyOwner {
-        payable(owner).call{value: amount}("");
+    function sweepETH(uint256 amount) external onlyOwner {
+        (bool success,) = payable(owner).call{value: amount}("");
+        require(success, "ETH transfer failed");
     }
 
     function setRouter(address _router) external onlyOwner {
@@ -431,7 +341,7 @@ contract TwyneAaveLiquidator {
     /// @notice Safe approve function that handles non-standard ERC20 tokens like USDT
     /// @dev copied from Solady
     function _safeApprove(address token, address to, uint256 amount) internal {
-        assembly("memory-safe") {
+        assembly ("memory-safe") {
             mstore(0x14, to) // Store the `to` argument.
             mstore(0x34, amount) // Store the `amount` argument.
             mstore(0x00, 0x095ea7b3000000000000000000000000) // `approve(address,uint256)`.
@@ -450,7 +360,7 @@ contract TwyneAaveLiquidator {
     /// Reverts upon failure.
     /// @dev copied from Solady
     function _safeTransfer(address token, address to, uint256 amount) internal {
-        assembly("memory-safe") {
+        assembly ("memory-safe") {
             mstore(0x14, to) // Store the `to` argument.
             mstore(0x34, amount) // Store the `amount` argument.
             mstore(0x00, 0xa9059cbb000000000000000000000000) // `transfer(address,uint256)`.
