@@ -50,7 +50,7 @@ SCRAPE_TIMEOUT_SECONDS = float(os.environ.get("METRICS_SCRAPE_TIMEOUT_SECONDS", 
 DRY_RUN = os.environ.get("METRICS_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # Chain id (as string, the JSON key) -> CloudWatch dimension label.
-CHAIN_LABELS = {"1": "mainnet", "8453": "base"}
+CHAIN_LABELS = {"1": "mainnet"}
 
 # (json_field, MetricName, Unit). Every field the endpoint may return is mapped;
 # count-gated fields (seconds_since_last_cv_check, oldest_cv_check_age_seconds)

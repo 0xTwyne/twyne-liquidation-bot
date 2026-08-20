@@ -23,12 +23,8 @@ contract DeployAaveLiquidator is Script {
             collateralVaultFactory = 0xa1517cCe0bE75700A8838EA1cEE0dc383cd3A332;
             router = 0x111111125421cA6dc452d289314280a0f8842A65; // 1inch router
             aavePool = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2; // Aave V3 Pool
-        } else if (block.chainid == 8453) {
-            // base
-            collateralVaultFactory = 0x1666FE8Cf509E6B6eC8c1bc6a53674f6Ee1D0381;
-            router = 0x111111125421cA6dc452d289314280a0f8842A65; // 1inch router (same across chains)
-            aavePool = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5; // Aave V3 Pool on Base
         } else {
+            // To add a chain: add a branch with its CollateralVaultFactory, 1inch router, and Aave V3 Pool.
             revert("chainid not supported");
         }
 

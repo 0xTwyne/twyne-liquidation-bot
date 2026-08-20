@@ -80,7 +80,7 @@ class ChainConfig:
         "ONEINCH_API_KEY",
         "RISK_DASHBOARD_URL",
         # "NOTIFICATION_URL",  # Optional
-        # Chain-specific RPC URLs (e.g. MAINNET_RPC_URL, BASE_RPC_URL) are
+        # Chain-specific RPC URLs (e.g. MAINNET_RPC_URL) are
         # validated per-chain in __init__ via the RPC_NAME config key — they
         # are intentionally NOT listed here so that only the chains actually
         # started require their RPC URL to be set.

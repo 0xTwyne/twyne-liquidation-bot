@@ -117,7 +117,7 @@ def main():
     Main function to parse arguments and execute withdrawal
     """
     # Load config for the specified chain using the load_chain_config function
-    config = load_chain_config(8453)
+    config = load_chain_config(1)
     active_collateral_vaults = get_user_collateral_vaults(config)
     if len(active_collateral_vaults) == 0:
         print("No active collateral vaults found.")

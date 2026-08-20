@@ -14,10 +14,16 @@
 # The private key is NEVER passed on the command line (not visible in ps /
 # /proc/*/cmdline). Only the keystore account name is used with --account.
 
-# Fixed addresses for base
-WETH=0x4200000000000000000000000000000000000006
-USDC=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-liq_contract=0x907d9f1420ab3c1ecc444E3E75B75CedA7454A68
+# Fixed addresses for Ethereum mainnet
+WETH=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+USDC=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+
+# Read the active Euler liquidator address from app/config.yaml (mainnet, chain 1).
+# This avoids hardcoding a stale address here — always reflects what the bot is
+# configured to use. To sweep the Aave liquidator instead, use AAVE_LIQUIDATOR_ADDRESS.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+liq_contract=$(cd "${SCRIPT_DIR}" && uv run python -c "import yaml; print(yaml.safe_load(open('app/config.yaml'))['chains'][1]['contracts']['EULER_LIQUIDATOR_ADDRESS'])")
+echo "Using liquidator contract: $liq_contract"
 
 # Secrets are read from environment variables, NOT from a `.env` file on
 # disk. Wrap invocations of this script with `op run` so the keys never
@@ -26,7 +32,7 @@ liq_contract=0x907d9f1420ab3c1ecc444E3E75B75CedA7454A68
 #   op run --env-file=.env.template -- bash sweep-liq-funds.sh
 #
 USER=${LIQUIDATOR_EOA:?Not set. Run via: op run --env-file=.env.template -- bash $0}
-RPC_URL=${BASE_RPC_URL:?Not set. Run via: op run --env-file=.env.template -- bash $0}
+RPC_URL=${MAINNET_RPC_URL:?Not set. Run via: op run --env-file=.env.template -- bash $0}
 
 # Keystore account name — create once with:
 #   cast wallet import liquidation-bot --interactive

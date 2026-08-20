@@ -17,11 +17,8 @@ contract DeployLiquidator is Script {
             // mainnet
             collateralVaultFactory = 0xa1517cCe0bE75700A8838EA1cEE0dc383cd3A332;
             router = 0x111111125421cA6dc452d289314280a0f8842A65; // 1inch router
-        } else if (block.chainid == 8453) {
-            // base
-            collateralVaultFactory = 0x1666FE8Cf509E6B6eC8c1bc6a53674f6Ee1D0381;
-            router = 0x111111125421cA6dc452d289314280a0f8842A65; // 1inch router (same across chains)
         } else {
+            // To add a chain: add a branch with its CollateralVaultFactory and 1inch router.
             revert("chainid not supported");
         }
 

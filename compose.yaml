@@ -37,7 +37,6 @@ services:
       - LIQUIDATOR_EOA
       - LIQUIDATOR_PRIVATE_KEY
       - MAINNET_RPC_URL
-      - BASE_RPC_URL
       - ONEINCH_API_KEY
       - SENTRY_DSN
       - NOTIFICATION_URL

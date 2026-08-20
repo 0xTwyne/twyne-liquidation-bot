@@ -9,7 +9,7 @@ running bot uses. No new RPC contracts to maintain.
 
 Usage:
     python -m app.liquidation.tools.pair_audit --chain 1
-    python -m app.liquidation.tools.pair_audit --chain 8453 --state-dir state
+    python -m app.liquidation.tools.pair_audit --chain 1 --state-dir state
 """
 
 import argparse
@@ -127,7 +127,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Group tracked CVs by (collateral, debt) pair and report counts.",
     )
-    parser.add_argument("--chain", type=int, required=True, help="Chain ID (1 or 8453)")
+    parser.add_argument("--chain", type=int, required=True, help="Chain ID (e.g. 1)")
     parser.add_argument("--state-dir", default="state", help="Directory holding <Chain>_state.json")
     args = parser.parse_args()
 

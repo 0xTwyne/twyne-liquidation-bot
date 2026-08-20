@@ -340,7 +340,7 @@ make run-docker
 - `op` CLI installed and signed in, OR `OP_SERVICE_ACCOUNT_TOKEN` env var set in the calling shell (recommended for unattended prod hosts so the bot can restart unattended after a host reboot).
 - All keys in `.env.template` resolve against the configured `OP_VAULT` (defaults to `liquidation-bot`; override per-environment via `OP_VAULT=liquidation-bot-staging make run-docker`). Verify with `make verify-vault` before deploying.
 
-For one-off operator scripts that need the signing key (`liquidationSetup.sh`, `sweep-liq-funds.sh`), wrap the same way:
+For one-off operator scripts that need the signing key (`sweep-liq-funds.sh`), wrap the same way:
 
 ```bash
 op run --env-file=.env.template -- bash sweep-liq-funds.sh

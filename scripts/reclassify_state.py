@@ -32,7 +32,7 @@ from app.liquidation.vaults.registry import detect_protocol
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify CV protocol classification in a bot state file.")
-    parser.add_argument("--chain", type=int, required=True, help="Chain ID (e.g. 1 or 8453)")
+    parser.add_argument("--chain", type=int, required=True, help="Chain ID (e.g. 1)")
     parser.add_argument("--state-file", required=True, help="Path to <Chain>_state.json")
     parser.add_argument("--apply", action="store_true", help="Rewrite the state file in place")
     parser.add_argument("--log-level", default="WARNING", help="DEBUG / INFO / WARNING (default WARNING)")

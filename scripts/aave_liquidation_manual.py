@@ -1,5 +1,5 @@
 """
-Standalone manual ops script to test Aave collateral vault liquidation on Base.
+Standalone manual ops script to test Aave collateral vault liquidation on Ethereum mainnet.
 
 Not a pytest test — it prompts for confirmation and broadcasts a real transaction.
 
@@ -22,7 +22,7 @@ from app.liquidation.vaults.base_vault import BaseLiquidator as Liquidator  # no
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("aave_liquidation_manual")
 
-BASE_CHAIN_ID = 8453
+CHAIN_ID = 1
 
 
 def main():
@@ -31,7 +31,7 @@ def main():
         sys.exit(1)
 
     vault_address = sys.argv[1]
-    config = load_chain_config(BASE_CHAIN_ID)
+    config = load_chain_config(CHAIN_ID)
 
     logger.info("Creating AaveCollateralVault for %s", vault_address)
     vault = AaveCollateralVault(vault_address, config)

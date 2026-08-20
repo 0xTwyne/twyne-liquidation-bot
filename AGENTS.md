@@ -4,7 +4,7 @@
 
 ## Purpose
 
-Liquidation bot for Twyne internal and external liquidations across Ethereum mainnet and Base. It includes a Flask app, Python monitoring engine, and Foundry liquidation contracts.
+Liquidation bot for Twyne internal and external liquidations on Ethereum mainnet. It includes a Flask app, Python monitoring engine, and Foundry liquidation contracts.
 
 ## Stack And Commands
 

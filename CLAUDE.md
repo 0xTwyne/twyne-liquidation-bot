@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Twyne Liquidation Bot — monitors lending positions on the Twyne platform and executes liquidations when positions become unhealthy. Supports both internal (Twyne) and external (Euler/Aave V3) liquidations across Ethereum Mainnet (chain 1) and Base (chain 8453). Forked from Euler's liquidation bot v2.
+Twyne Liquidation Bot — monitors lending positions on the Twyne platform and executes liquidations when positions become unhealthy. Supports both internal (Twyne) and external (Euler/Aave V3) liquidations on Ethereum Mainnet (chain 1), the only chain Twyne is deployed on. The engine is multi-chain: to add a chain, add a block under `chains:` in `app/config.yaml` and list its ID in `MONITORED_CHAIN_IDS`. Forked from Euler's liquidation bot v2.
 
 ## Build & Development Commands
 
@@ -85,7 +85,7 @@ make run-docker
 
 - `app/config.yaml` — per-chain contract addresses, health score thresholds, update intervals, ABI paths
 - `.env.template` — 1Password references (committed). Resolved at runtime by `make run-docker`/`make dev` via `op run`. NO plaintext `.env` is written to disk by the canonical entrypoints. `.env.example` is for dev convenience with throwaway keys only.
-- `foundry.toml` — Solidity profiles: `default` (contracts/ src), `base`, `mainnet` (optimizer 20k runs, Cancun EVM)
+- `foundry.toml` — Solidity profiles: `default` (contracts/ src), `mainnet` (optimizer 20k runs, Cancun EVM)
 
 ### State & Persistence
 

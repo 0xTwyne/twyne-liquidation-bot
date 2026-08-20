@@ -54,45 +54,35 @@ interface IATokenScaled {
 contract HealthStatViewerTest is Test {
     // Deployed HealthStatViewer addresses
     address constant MAINNET_HSV = 0x5A919b9A77ee391AB48208A93e0684c24F99B07a;
-    address constant BASE_HSV = 0xe917E65288014092C5d813bb80989D72520606A0;
 
     // Aave V3 Pool
     address constant MAINNET_AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
-    address constant BASE_AAVE_POOL = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;
 
     // Collateral vault factories
     address constant MAINNET_CV_FACTORY = 0xa1517cCe0bE75700A8838EA1cEE0dc383cd3A332;
-    address constant BASE_CV_FACTORY = 0x1666FE8Cf509E6B6eC8c1bc6a53674f6Ee1D0381;
 
     HealthStatViewer hsv;
 
     function _deployHsv() internal {
-        address aavePool = block.chainid == 1 ? MAINNET_AAVE_POOL : BASE_AAVE_POOL;
-        hsv = new HealthStatViewer(aavePool);
+        hsv = new HealthStatViewer(MAINNET_AAVE_POOL);
     }
 
     function setUp() public {
-        if (block.chainid != 1 && block.chainid != 8453) {
+        if (block.chainid != 1) {
             revert("chainid not recognized");
         }
     }
 
     /// @notice Verify the deployed HealthStatViewer has correct aavePool set
     function testDeployedAavePool() public {
-        if (block.chainid == 1) {
-            HealthStatViewer deployed = HealthStatViewer(MAINNET_HSV);
-            assertEq(deployed.aavePool(), MAINNET_AAVE_POOL, "mainnet aavePool mismatch");
-        } else if (block.chainid == 8453) {
-            HealthStatViewer deployed = HealthStatViewer(BASE_HSV);
-            assertEq(deployed.aavePool(), BASE_AAVE_POOL, "base aavePool mismatch");
-        }
+        HealthStatViewer deployed = HealthStatViewer(MAINNET_HSV);
+        assertEq(deployed.aavePool(), MAINNET_AAVE_POOL, "mainnet aavePool mismatch");
     }
 
     /// @notice Deploy a fresh HealthStatViewer and verify constructor sets aavePool correctly
     function testDeployFresh() public {
         _deployHsv();
-        address expected = block.chainid == 1 ? MAINNET_AAVE_POOL : BASE_AAVE_POOL;
-        assertEq(hsv.aavePool(), expected, "aavePool should be set correctly");
+        assertEq(hsv.aavePool(), MAINNET_AAVE_POOL, "aavePool should be set correctly");
     }
 
     /// @notice Test health() on a mainnet Euler vault with an active position (liquidatable)
@@ -210,30 +200,6 @@ contract HealthStatViewerTest is Test {
         if (liabilityValue == 0) {
             assertEq(healthFactor, type(uint256).max, "zero liability should give max HF");
         }
-    }
-
-    /// @notice Test health() on a Base Euler vault
-    function testHealthEulerVaultBase() public {
-        if (block.chainid != 8453) return;
-        // Block 41325539 is after the CV factory deployment (38122653)
-        vm.rollFork(41325539);
-        _deployHsv();
-
-        // Known-active Euler collateral vault on Base at the pinned block above.
-        address vault = 0x23CEAd7E58D7d4aFadb4A617f6dA3937ADd6625c;
-        vm.label(vault, "BaseEulerCollateralVault");
-
-        assertTrue(ICollateralVaultFactory(BASE_CV_FACTORY).isCollateralVault(vault), "not a valid collateral vault");
-
-        (uint256 extHF, uint256 inHF, uint256 extDebt, uint256 intDebt) = hsv.health(vault);
-
-        console2.log("=== health() Euler Base ===");
-        console2.log("extHF:", extHF);
-        console2.log("inHF:", inHF);
-        console2.log("extDebt:", extDebt);
-        console2.log("intDebt:", intDebt);
-
-        assertGt(extDebt, 0, "external debt should be non-zero");
     }
 
     /// @notice Test that health() return values match what the Python bot expects:
@@ -489,29 +455,6 @@ contract HealthStatViewerTest is Test {
             assertEq(s.twyneLTV, 0, "LTV_t 0 on zero debt");
             assertEq(s.externalLTV, 0, "LTV_e 0 on zero debt");
         }
-    }
-
-    /// @notice positionStats() on a known active Base Euler vault.
-    function testPositionStatsEulerBase() public {
-        if (block.chainid != 8453) return;
-        vm.rollFork(41325539);
-        _deployHsv();
-
-        address vault = 0x23CEAd7E58D7d4aFadb4A617f6dA3937ADd6625c;
-        vm.label(vault, "BaseEulerCollateralVault");
-        assertTrue(ICollateralVaultFactory(BASE_CV_FACTORY).isCollateralVault(vault), "not a CV");
-
-        PositionStats memory s = hsv.positionStats(vault);
-        (uint256 extHF, uint256 inHF, uint256 extDebt,) = hsv.health(vault);
-
-        console2.log("=== positionStats() Euler Base ===");
-        console2.log("borrowUsd:", s.borrowUsd);
-        console2.log("extHF:", s.extHF);
-        console2.log("inHF:", s.inHF);
-
-        assertEq(s.borrowUsd, extDebt, "borrowUsd parity with health()");
-        assertEq(s.extHF, extHF, "extHF parity");
-        assertEq(s.inHF, inHF, "inHF parity");
     }
 
     /// @notice positionStats() clamps unbounded operating LTVs before uint32 casts.

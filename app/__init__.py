@@ -62,7 +62,8 @@ def _parse_chain_ids() -> list:
     """Read monitored chain IDs from MONITORED_CHAIN_IDS env var (comma-separated).
     Defaults to chain 1 (Ethereum mainnet) when the variable is not set.
 
-    Example: MONITORED_CHAIN_IDS=1,8453 monitors both mainnet and Base.
+    Example: MONITORED_CHAIN_IDS=1. Comma-separate IDs to monitor more chains
+    once they have a block under `chains:` in app/config.yaml.
     """
     raw = os.environ.get("MONITORED_CHAIN_IDS", "1")
     ids = [int(cid.strip()) for cid in raw.split(",") if cid.strip()]

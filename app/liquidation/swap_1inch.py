@@ -536,7 +536,7 @@ def main():
     Main function to parse arguments and execute token swaps
     """
     parser = argparse.ArgumentParser(description="Swap tokens using 1inch API")
-    parser.add_argument("--chain-id", type=int, default=8453, help="Chain ID (default: 8453 for Base)")
+    parser.add_argument("--chain-id", type=int, default=1, help="Chain ID (default: 1 for Ethereum mainnet)")
     parser.add_argument("--src-token", type=str, required=True, help="Source token address")
     parser.add_argument("--dst-token", type=str, required=True, help="Destination token address")
     parser.add_argument("--amount", type=str, help="Amount to swap (in token units, e.g., 1.5)")
