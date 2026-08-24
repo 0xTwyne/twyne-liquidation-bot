@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
@@ -15,11 +16,93 @@ if TYPE_CHECKING:
 from web3 import Web3
 
 from app.liquidation.config_loader import load_chain_config
+from app.liquidation.constants import ONEINCH_MIN_RETURN_END, ONEINCH_MIN_RETURN_OFFSET
 from app.liquidation.contracts import create_contract_instance
 from app.liquidation.decorators import make_api_request
 from app.liquidation.logging_config import setup_logger
+from app.liquidation.swap_provider import SwapData
+from app.liquidation.vaults.base_vault import BaseLiquidator
 
 logger = setup_logger()
+
+
+def decode_1inch_min_return(swap_data_bytes: bytes) -> int:
+    """Decode the guaranteed ``minReturnAmount`` from encoded 1inch v6 swap calldata.
+
+    The min-return is a big-endian uint256 occupying the 32-byte slice
+    ``[ONEINCH_MIN_RETURN_OFFSET:ONEINCH_MIN_RETURN_END]`` of the decoded swap-data
+    bytes. Raises ``ValueError`` if the calldata is too short to contain that slot;
+    valid 1inch v6 swap calldata is always long enough.
+    """
+    if len(swap_data_bytes) < ONEINCH_MIN_RETURN_END:
+        raise ValueError(f"1inch swap data is too short to decode minReturn: {len(swap_data_bytes)} bytes")
+    return int.from_bytes(swap_data_bytes[ONEINCH_MIN_RETURN_OFFSET:ONEINCH_MIN_RETURN_END], "big")
+
+
+# 1inch's free tier allows ~1 request/second per API key. The old code slept a
+# flat 1.1s BEFORE every request unconditionally, adding ≥2.2s of pure latency to
+# the quote+swap sequence on the critical liquidation path even when no request had
+# been made for minutes (finding P1). Instead, enforce a *minimum interval* between
+# consecutive requests: a call only waits for the time still owed since the previous
+# call, so an idle bot pays zero spacing latency and a bursting bot is still throttled
+# to the allowed rate. Reactive 429 Retry-After back-off is handled separately and
+# unchanged in decorators.retry_request (DEV-542) — this limiter is the proactive
+# spacing layer and deliberately does not duplicate that logic.
+ONEINCH_MIN_REQUEST_INTERVAL_SECONDS = 1.1
+
+
+class _MinIntervalRateLimiter:
+    """Token-bucket-style minimum-interval limiter shared across all swappers.
+
+    All ``OneInchSwapper`` instances hit ``api.1inch.dev`` with the same API key
+    (the key is per-account, not per-chain), so a single process-wide limiter is the
+    correct granularity. ``acquire()`` reserves the next time slot under a lock, then
+    sleeps OUTSIDE the lock for only the residual wait, so concurrent worker threads
+    are spaced to the configured rate without one thread blocking another for the full
+    interval. ``time.monotonic`` is used so wall-clock adjustments can't skew spacing.
+    """
+
+    def __init__(self, min_interval_seconds: float) -> None:
+        self.min_interval = min_interval_seconds
+        self._lock = threading.Lock()
+        self._next_allowed_at = 0.0
+
+    def acquire(self) -> float:
+        """Block until this caller's slot is due. Returns the seconds slept (for tests/logging)."""
+        with self._lock:
+            now = time.monotonic()
+            scheduled = max(now, self._next_allowed_at)
+            # Reserve the slot AFTER this one so the next caller is spaced by min_interval.
+            self._next_allowed_at = scheduled + self.min_interval
+            sleep_for = scheduled - now
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        return sleep_for
+
+
+# Process-wide limiter for all 1inch HTTP requests.
+_ONEINCH_RATE_LIMITER = _MinIntervalRateLimiter(ONEINCH_MIN_REQUEST_INTERVAL_SECONDS)
+
+
+def _slippage_for_min_return(expected_out: int, min_return: int, default_slippage: float = 1.0) -> float:
+    """Pick a 1inch slippage % so the *guaranteed* minReturn covers ``min_return``.
+
+    1inch is exact-in: it sets ``minReturnAmount = expectedOut * (1 - slippage)``. If
+    slippage is a fixed % of the expected output, that floor can land *below* a hard
+    downstream requirement (e.g. a flashloan repayment), so a swap can clear its own
+    floor yet still under-deliver. We instead tighten slippage just enough that
+    ``expectedOut * (1 - slippage/100) >= min_return``:
+
+    - Comfortable margin (expectedOut >> min_return): returns ``default_slippage``
+      (keeps the usual MEV/slippage protection).
+    - Thin margin: returns a smaller slippage so the floor is pinned at ``min_return``.
+    - Underwater (expectedOut <= min_return): returns 0.0 (tightest floor; the swap
+      will revert downstream rather than silently under-deliver).
+    """
+    if expected_out <= 0:
+        return default_slippage
+    headroom_pct = max(0.0, (expected_out - min_return) / expected_out * 100.0)
+    return min(default_slippage, headroom_pct)
 
 
 class OneInchSwapper:
@@ -72,7 +155,7 @@ class OneInchSwapper:
 
             # Make API request
             url = f"{self.api_base_url}/{self.chain_id}/quote"
-            time.sleep(1.1)
+            _ONEINCH_RATE_LIMITER.acquire()
             response = make_api_request(url, headers=self.headers, params=params)
 
             if not response:
@@ -119,7 +202,7 @@ class OneInchSwapper:
                 # Convert addresses to checksum format
                 src_token = Web3.to_checksum_address(src_token)
                 dst_token = Web3.to_checksum_address(dst_token)
-                recipient = Web3.to_checksum_address(recipient)
+                recipient = Web3.to_checksum_address(recipient or self.config.LIQUIDATOR_EOA)
 
                 # Prepare request parameters
                 params = {
@@ -144,7 +227,7 @@ class OneInchSwapper:
 
                 # Make API request
                 url = f"{self.api_base_url}/{self.chain_id}/swap"
-                time.sleep(1.1)
+                _ONEINCH_RATE_LIMITER.acquire()
                 response = make_api_request(url, headers=self.headers, params=params)
 
                 if not response:
@@ -164,6 +247,94 @@ class OneInchSwapper:
                 logger.error("Error getting swap transaction: %s", ex, exc_info=True)
                 return None
 
+    def get_swap_transaction_with_min_return(
+        self,
+        src_token: str,
+        dst_token: str,
+        amount: int,
+        recipient: str,
+        min_return: int,
+        default_slippage: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Build a swap whose guaranteed ``minReturnAmount`` covers ``min_return``.
+
+        Fetches a fresh quote to learn the expected output, derives a slippage that
+        pins the 1inch floor at ``min_return`` for thin margins (and keeps
+        ``default_slippage`` for comfortable ones), then requests the swap tx. This
+        prevents the failure mode where a swap clears its own (expected-relative)
+        floor but still under-delivers versus a hard downstream requirement such as a
+        flashloan repayment.
+        """
+        quote = self.get_swap_quote(src_token, dst_token, amount, default_slippage)
+        expected_out = 0
+        if quote:
+            raw = quote.get("dstAmount") or quote.get("toAmount")
+            try:
+                expected_out = int(raw) if raw is not None else 0
+            except (TypeError, ValueError):
+                expected_out = 0
+
+        slippage = _slippage_for_min_return(expected_out, min_return, default_slippage)
+        if expected_out and expected_out < min_return:
+            logger.warning(
+                "1inch quote (expectedOut=%s) is below the required minReturn=%s; "
+                "swap will use slippage=0 and likely revert downstream",
+                expected_out,
+                min_return,
+            )
+        logger.info(
+            "1inch min-return swap: expectedOut=%s, minReturn=%s, slippage=%.4f%%",
+            expected_out,
+            min_return,
+            slippage,
+        )
+        return self.get_swap_transaction(
+            src_token,
+            dst_token,
+            amount,
+            externallyLiquidated=False,
+            slippage=slippage,
+            recipient=recipient,
+        )
+
+    def build_swap(
+        self,
+        src_token: str,
+        dst_token: str,
+        amount: int,
+        recipient: str,
+        min_return: int,
+        externally_liquidated: bool,
+    ) -> Optional["SwapData"]:
+        """SwapProvider seam (DEV-579): build a swap leg and report its guaranteed min-return.
+
+        Behavior-preserving wrapper over the existing 1inch flows: the external path uses
+        an exact-in zero-slippage swap; the internal path tightens slippage so the
+        guaranteed floor covers ``min_return`` (the flashloan-repayment requirement). The
+        min-return is decoded from the returned 1inch v6 calldata via ``decode_1inch_min_return``.
+        """
+        if amount <= 0:
+            return None
+
+        if externally_liquidated:
+            oneinch_data = self.get_swap_transaction(src_token, dst_token, int(amount), True, 0, recipient)
+        else:
+            oneinch_data = self.get_swap_transaction_with_min_return(
+                src_token, dst_token, int(amount), recipient, min_return, default_slippage=1.0
+            )
+
+        if not oneinch_data or "data" not in oneinch_data:
+            logger.error("Invalid 1inch swap data: %s", oneinch_data)
+            return None
+
+        calldata = bytes.fromhex(oneinch_data["data"].replace("0x", ""))
+        try:
+            decoded_min_return = decode_1inch_min_return(calldata)
+        except ValueError as ex:
+            logger.error("Cannot decode 1inch minReturn: %s", ex)
+            return None
+        return SwapData(calldata=calldata, min_return=decoded_min_return)
+
     def check_allowance(self, token_address: str, amount: int) -> bool:
         """
         Check if the 1inch router has allowance to spend tokens
@@ -181,7 +352,7 @@ class OneInchSwapper:
             # Get the 1inch router address
             params = {"tokenAddress": token_address}
             url = f"{self.api_base_url}/{self.chain_id}/approve/spender"
-            time.sleep(1.1)
+            _ONEINCH_RATE_LIMITER.acquire()
             response = make_api_request(url, headers=self.headers, params=params)
 
             if not response:
@@ -223,7 +394,7 @@ class OneInchSwapper:
                 "amount": str(2**256 - 1),  # Max uint256 value
             }
             url = f"{self.api_base_url}/{self.chain_id}/approve/transaction"
-            time.sleep(1.1)
+            _ONEINCH_RATE_LIMITER.acquire()
             response = make_api_request(url, headers=self.headers, params=params)
 
             if not response:
@@ -237,7 +408,6 @@ class OneInchSwapper:
                 "data": response["data"],
                 "value": int(response["value"]),
                 "gasPrice": self.w3.eth.gas_price * 2,
-                "nonce": self.w3.eth.get_transaction_count(self.config.LIQUIDATOR_EOA),
             }
 
             # Estimate gas
@@ -248,9 +418,10 @@ class OneInchSwapper:
                 logger.error("Error estimating gas for approval: %s", ex, exc_info=True)
                 tx["gas"] = 100000  # Default gas limit for approvals
 
-            # Sign and send transaction
-            signed_tx = self.w3.eth.account.sign_transaction(tx, self.config.LIQUIDATOR_EOA_PRIVATE_KEY)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            # Sign and send transaction through the per-EOA nonce manager (DEV-530).
+            # sign_and_send_transaction internally uses signed_tx.raw_transaction, so it
+            # also carries the web3 v7 rename from DEV-539.
+            tx_hash, _signed_tx_payload = BaseLiquidator.sign_and_send_transaction(tx, self.config)
 
             logger.info("Approval transaction sent: %s", tx_hash.hex())
 
@@ -308,12 +479,12 @@ class OneInchSwapper:
                 "value": int(swap_data["value"]),
                 "gasPrice": int(swap_data["gasPrice"]),
                 "gas": int(swap_data["gas"]),
-                "nonce": self.w3.eth.get_transaction_count(self.config.LIQUIDATOR_EOA),
             }
 
-            # Sign and send transaction
-            signed_tx = self.w3.eth.account.sign_transaction(tx, self.config.LIQUIDATOR_EOA_PRIVATE_KEY)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            # Sign and send transaction through the per-EOA nonce manager (DEV-530).
+            # sign_and_send_transaction internally uses signed_tx.raw_transaction, so it
+            # also carries the web3 v7 rename from DEV-539.
+            tx_hash, _signed_tx_payload = BaseLiquidator.sign_and_send_transaction(tx, self.config)
 
             logger.info("Swap transaction sent: %s", tx_hash.hex())
 
@@ -365,7 +536,7 @@ def main():
     Main function to parse arguments and execute token swaps
     """
     parser = argparse.ArgumentParser(description="Swap tokens using 1inch API")
-    parser.add_argument("--chain-id", type=int, default=8453, help="Chain ID (default: 8453 for Base)")
+    parser.add_argument("--chain-id", type=int, default=1, help="Chain ID (default: 1 for Ethereum mainnet)")
     parser.add_argument("--src-token", type=str, required=True, help="Source token address")
     parser.add_argument("--dst-token", type=str, required=True, help="Destination token address")
     parser.add_argument("--amount", type=str, help="Amount to swap (in token units, e.g., 1.5)")
@@ -406,9 +577,12 @@ def main():
         args.dst_token,
         args.slippage,
     )
-    quote = swapper.get_swap_quote(args.src_token, args.dst_token, amount, args.slippage, args.recipient)
+    quote = swapper.get_swap_quote(args.src_token, args.dst_token, amount, args.slippage)
     logger.info("Quote: %s", quote)
-    input("!!! DO YOU WANT TO SWAP?")
+    confirmation = input("!!! DO YOU WANT TO SWAP? Type y/yes to continue: ").strip().lower()
+    if confirmation not in {"y", "yes"}:
+        print("Swap aborted.")
+        return 1
 
     # Execute swap
     tx_hash, swap_data = swapper.execute_swap(args.src_token, args.dst_token, amount, args.slippage, args.recipient)

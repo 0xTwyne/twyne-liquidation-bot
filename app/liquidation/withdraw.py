@@ -9,7 +9,9 @@ from web3 import Web3
 
 from app.liquidation.config_loader import load_chain_config
 from app.liquidation.contracts import create_contract_instance
+from app.liquidation.gas import get_eip1559_fees
 from app.liquidation.logging_config import setup_logger
+from app.liquidation.vaults.base_vault import BaseLiquidator
 
 logger = setup_logger()
 
@@ -66,14 +68,13 @@ def withdraw_collateral(vault_address: str, config, recipient_address: str = Non
         vault_owner = vault_instance.functions.borrower().call()
         # eWETH.balanceOf(vault_address)
 
-        # Get transaction parameters
-        nonce = config.w3.eth.get_transaction_count(config.LIQUIDATOR_EOA)
-        suggested_gas_price = int(config.w3.eth.gas_price * 50.0)
+        # Manual recovery script: aggressive priority fee + extra baseFee headroom
+        # to ensure ASAP inclusion (this is a one-shot, not a hot path).
+        fees = get_eip1559_fees(config.w3, tip_gwei=10.0, base_mult=3.0)
 
         logger.info("======= WITHDRAWAL =======")
         logger.info("Withdrawing collateral from vault: %s", vault_address)
         logger.info("collateral_balance: %s", collateral_balance)
-        logger.info("Running withdrawal with nonce: %s", nonce)
         logger.info("vault_owner: %s", vault_owner)
         logger.info("recipient_address: %s", recipient_address)
         logger.info("======= END WITHDRAWAL =======")
@@ -85,18 +86,17 @@ def withdraw_collateral(vault_address: str, config, recipient_address: str = Non
             {
                 "chainId": config.CHAIN_ID,
                 "from": config.LIQUIDATOR_EOA,
-                "gasPrice": suggested_gas_price,
-                "nonce": nonce,
+                **fees.to_tx_fields(),
+                "nonce": 0,
             }
         )
 
-        # Sign and send transaction
-        signed_tx = config.w3.eth.account.sign_transaction(withdrawal_tx, config.LIQUIDATOR_EOA_PRIVATE_KEY)
-
-        tx_hash = config.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        # Sign and send transaction through the per-EOA nonce manager (DEV-530), which
+        # assigns the real nonce at send time and internally uses raw_transaction (web3 v7).
+        tx_hash, signed_tx_payload = BaseLiquidator.sign_and_send_transaction(withdrawal_tx, config)
 
         # Wait for transaction receipt
-        logger.info("Transaction sent, hash: %s", tx_hash.hex())
+        logger.info("Transaction sent, hash: %s nonce: %s", tx_hash.hex(), signed_tx_payload["nonce"])
         logger.info("Waiting for transaction confirmation...")
         time.sleep(5)
         tx_receipt = config.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
@@ -117,17 +117,22 @@ def main():
     Main function to parse arguments and execute withdrawal
     """
     # Load config for the specified chain using the load_chain_config function
-    config = load_chain_config(8453)
+    config = load_chain_config(1)
     active_collateral_vaults = get_user_collateral_vaults(config)
-    if len(active_collateral_vaults) > 0:
-        for vault in active_collateral_vaults:
-            tx_hash, tx_receipt = withdraw_collateral(vault, config)
-            if tx_hash:
-                print(f"Withdrawal successful! Transaction hash: {tx_hash}")
-                return 0
-            else:
-                print("Withdrawal failed. Check logs for details.")
-                return 1
+    if len(active_collateral_vaults) == 0:
+        print("No active collateral vaults found.")
+        return 0
+
+    failures = 0
+    for vault in active_collateral_vaults:
+        tx_hash, tx_receipt = withdraw_collateral(vault, config)
+        if tx_hash and tx_receipt:
+            print(f"Withdrawal successful for {vault}! Transaction hash: {tx_hash}")
+        else:
+            failures += 1
+            print(f"Withdrawal failed for {vault}. Check logs for details.")
+
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

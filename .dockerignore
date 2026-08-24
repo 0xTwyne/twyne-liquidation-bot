@@ -33,3 +33,9 @@
 **/lib
 **/out
 **/cache
+# Exclude runtime data directories so production logs, vault state, and
+# Foundry broadcast artefacts are never baked into image layers.
+logs/
+state/
+broadcast/
+test/

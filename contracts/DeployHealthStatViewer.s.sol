@@ -14,9 +14,8 @@ contract DeployHealthStatViewer is Script {
     function run() public {
         if (block.chainid == 1) { // mainnet
             aavePool = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
-        } else if (block.chainid == 8453) { // base
-            aavePool = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;
         } else {
+            // To add a chain: add a branch with its Aave V3 Pool address.
             revert("chainid not supported");
         }
 

@@ -1,33 +1,37 @@
 """
-Standalone script to test Aave collateral vault liquidation on Base.
+Standalone manual ops script to test Aave collateral vault liquidation on Ethereum mainnet.
+
+Not a pytest test — it prompts for confirmation and broadcasts a real transaction.
 
 Usage:
-    python test_aave_liquidation.py <collateral_vault_address>
+    python scripts/aave_liquidation_manual.py <collateral_vault_address>
 """
 
 import logging
 import sys
 
 from dotenv import load_dotenv
+
+# .env must be loaded before importing app modules that read env at import time.
 load_dotenv()
 
-from app.liquidation.config_loader import load_chain_config
-from app.liquidation.vaults.aave_vault import AaveCollateralVault, AaveLiquidator
-from app.liquidation.vaults.base_vault import BaseLiquidator as Liquidator
+from app.liquidation.config_loader import load_chain_config  # noqa: E402
+from app.liquidation.vaults.aave_vault import AaveCollateralVault, AaveLiquidator  # noqa: E402
+from app.liquidation.vaults.base_vault import BaseLiquidator as Liquidator  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-logger = logging.getLogger("test_aave_liquidation")
+logger = logging.getLogger("aave_liquidation_manual")
 
-BASE_CHAIN_ID = 8453
+CHAIN_ID = 1
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python test_aave_liquidation.py <collateral_vault_address>")
+        print("Usage: python scripts/aave_liquidation_manual.py <collateral_vault_address>")
         sys.exit(1)
 
     vault_address = sys.argv[1]
-    config = load_chain_config(BASE_CHAIN_ID)
+    config = load_chain_config(CHAIN_ID)
 
     logger.info("Creating AaveCollateralVault for %s", vault_address)
     vault = AaveCollateralVault(vault_address, config)
@@ -38,8 +42,14 @@ def main():
 
     # Check liquidation status
     can_liq, ext_liq, max_release, max_repay, total_assets = vault.check_liquidation(config.LIQUIDATOR_EOA)
-    logger.info("canLiquidate=%s, externallyLiquidated=%s, maxRelease=%s, maxRepay=%s, totalAssets=%s",
-                can_liq, ext_liq, max_release, max_repay, total_assets)
+    logger.info(
+        "canLiquidate=%s, externallyLiquidated=%s, maxRelease=%s, maxRepay=%s, totalAssets=%s",
+        can_liq,
+        ext_liq,
+        max_release,
+        max_repay,
+        total_assets,
+    )
 
     health_factor = vault.get_health_factor()
     logger.info("Aave health factor: %s", health_factor)

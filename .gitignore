@@ -33,7 +33,17 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Coverage artifacts (pytest-cov / coverage.py — see `make coverage`)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # foundry lock file
 foundry.lock
 /lib
 
+.claude/skills/gitnexus/
+
+# GitNexus index (may contain GitHub tokens in .gitnexus/meta.json; see twyne-root DEV-482)
+.gitnexus/

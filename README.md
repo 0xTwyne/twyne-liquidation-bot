@@ -24,7 +24,222 @@ If the flask app is running as expected, the first step is to cache all data fro
 
 ## Running in production
 
-Make sure the EOA that is used has sufficient gas for transactions. One area for improvement is to use keystores instead of a private key in the .env file, but since this EOA is primarily for holding gas (due to how flashloans are used), there are less funds at risk than otherwise could be.
+Make sure the EOA that is used has sufficient gas for transactions.
+
+### Secrets via 1Password (recommended)
+
+The bot's secrets — `LIQUIDATOR_PRIVATE_KEY`, RPC URLs, `ONEINCH_API_KEY`, etc. — live in a 1Password vault rather than a plaintext `.env`. The committed `.env.template` contains only `op://` references; the actual values are resolved at runtime by the [1Password CLI](https://1password.com/downloads/command-line) (`op`).
+
+**One-time setup** (per environment / per operator):
+
+1. Install `op`, sign in: `op signin`
+2. Verify every key in the template resolves against the vault: `make verify-vault`
+   - The default vault is `liquidation-bot`. Override per-environment: `OP_VAULT=liquidation-bot-staging make verify-vault`
+
+**Daily use:**
+
+| Goal | Command |
+|---|---|
+| Run the bot in Docker (production) | `make run-docker` — auto-runs `make env-resolve` first to materialize a fresh `.env` from the template. |
+| Run flask locally without Docker | `make dev` — uses `op run` to inject secrets directly into the wrapped process; never writes a plaintext `.env` to disk. |
+| Manually regenerate `.env` from template | `make env-resolve` |
+| Use a non-default vault | `OP_VAULT=<name> make <target>` |
+
+The `.env` file remains gitignored. After `make env-resolve` it contains the resolved plaintext values — treat it as ephemeral runtime state; rotate any secret that appears in it if the file or its host is compromised.
+
+### Deploying on a long-running VM with systemd
+
+For a VM that should auto-start the bot on boot and survive crashes / reboots, run it under systemd. The bot pulls fresh secrets from 1Password on every restart, so rotation is just "update the value in 1P and `systemctl restart`."
+
+> **How the unit gets `OP_SERVICE_ACCOUNT_TOKEN` — two supported options.**
+> - **(A) Root-owned `EnvironmentFile`** (steps 2–4 below): the token sits, root-only, in
+>   `/etc/liquidation-bot/op-token.env`.
+> - **(B) Fetch from a secrets manager at boot.** The
+>   unit's `ExecStart` is a wrapper (`/usr/local/bin/start-liquidation-bot`) that pulls the token
+>   from **AWS Secrets Manager** via the instance-profile IAM role, exports it, and execs
+>   `make run-docker`; nothing lands on disk. With (B) there is **no** `EnvironmentFile=` and
+>   **no** `/etc/liquidation-bot/op-token.env` — see "Alternative: fetch the token from AWS
+>   Secrets Manager" after the unit below.
+
+#### 1. Install the 1Password CLI on the VM
+
+There's no `op` package on Amazon Linux 2023 by default. The simplest install is the pinned binary from the official mirror:
+
+```bash
+OP_VERSION=2.30.3
+curl -sSfL -o /tmp/op.zip "https://cache.agilebits.com/dist/1P/op2/pkg/v${OP_VERSION}/op_linux_amd64_v${OP_VERSION}.zip"
+unzip -d /tmp/op /tmp/op.zip
+sudo install -m 0755 /tmp/op/op /usr/local/bin/op
+rm -rf /tmp/op /tmp/op.zip
+op --version   # should print 2.30.3
+```
+
+#### 2. Create a vault-scoped Service Account in 1Password
+
+In the 1Password web UI: **Developer → Service Accounts → Create**. Give it **read-only** access to the `liquidation-bot` vault only. Copy the `ops_...` token (shown once).
+
+#### 3. Drop the token into a root-owned env file on the VM
+
+```bash
+sudo install -d -m 0700 -o root -g root /etc/liquidation-bot
+sudoedit /etc/liquidation-bot/op-token.env
+# Add a single line, no spaces around =:
+#   OP_SERVICE_ACCOUNT_TOKEN=ops_...
+sudo chmod 0600 /etc/liquidation-bot/op-token.env
+```
+
+Verify (without leaking the token):
+
+```bash
+sudo wc -c /etc/liquidation-bot/op-token.env       # should be ~880 bytes
+sudo head -c 25 /etc/liquidation-bot/op-token.env  # → "OP_SERVICE_ACCOUNT_TOKEN="
+```
+
+Smoke test that the token + op + vault scope all work, by running `op vault list` in a systemd context that mirrors what the service will do:
+
+```bash
+sudo systemd-run --collect --wait \
+  --uid=$USER --gid=docker \
+  -p EnvironmentFile=/etc/liquidation-bot/op-token.env \
+  --unit=op-vault-test \
+  /usr/local/bin/op vault list
+sudo journalctl -u op-vault-test --no-pager -n 5
+# expect to see "liquidation-bot" in the listed vaults
+```
+
+#### 4. Write the systemd unit
+
+`sudoedit /etc/systemd/system/liquidation-bot.service`:
+
+```ini
+[Unit]
+Description=Twyne Liquidation Bot
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ec2-user/liquidation-bot
+EnvironmentFile=/etc/liquidation-bot/op-token.env
+ExecStart=/usr/bin/make run-docker
+ExecStop=/usr/local/bin/docker-compose down
+Restart=on-failure
+RestartSec=30s
+
+User=ec2-user
+Group=docker
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Three things to double-check before enabling:
+
+| Directive | Check |
+|---|---|
+| `WorkingDirectory=` | Match the actual path you cloned into. `/home/ec2-user/liquidation-bot` is typical for EC2; `/opt/liquidation-bot` is the convention for site-installed apps. |
+| `User=` / `Group=` | The user must own the working directory and be in the `docker` group: `id <user>` should list `docker`. |
+| `ExecStop=` | Path must match your docker-compose binary. `/usr/local/bin/docker-compose` is the standalone install (legacy syntax). If your VM has the modern Docker plugin instead, use `ExecStop=/usr/bin/docker compose down`. Run `which docker-compose` and `docker compose version` to find out. |
+
+Three things deliberately *not* in this unit:
+
+- **`ProtectHome=`** — left at the default. `ProtectHome=true` would mount an empty stub over `/home`, so any `WorkingDirectory` under `/home/<user>/...` fails CHDIR with "Permission denied". Only set this if your repo lives outside `/home`.
+- **`ProtectSystem=strict`** — would make most of the filesystem read-only, which can interfere with Docker's image / build layer paths. Skipped for a smaller blast radius of unexpected failure modes; re-add later once the basic flow is verified.
+- **`ReadWritePaths=`** — only meaningful in combination with `ProtectSystem=strict`. Omit when that's omitted.
+
+#### Alternative: fetch the token from AWS Secrets Manager
+
+If your VM runs on EC2, you can skip `EnvironmentFile=/etc/liquidation-bot/op-token.env` and
+run a wrapper at `ExecStart` instead, so the token is fetched at exec time and never lands on
+disk — replace the `EnvironmentFile=` + `ExecStart=` lines from step 4 with a single line:
+
+```ini
+# [Service]  (no EnvironmentFile= line)
+ExecStart=/usr/local/bin/start-liquidation-bot
+```
+
+`/usr/local/bin/start-liquidation-bot` (root-owned, `0755`):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+OP_SERVICE_ACCOUNT_TOKEN=$(aws --region <your-region> secretsmanager get-secret-value \
+  --secret-id <your-secret-id> \
+  --query SecretString --output text)
+export OP_SERVICE_ACCOUNT_TOKEN
+cd /path/to/liquidation-bot
+exec /usr/bin/make run-docker
+```
+
+Requirements: the EC2 instance-profile role needs `secretsmanager:GetSecretValue` on that one
+secret ARN, and the secret holds the `ops_…` service-account token. Skip steps 2–3's
+`op-token.env` entirely. Rotation is "update the value in Secrets Manager and `systemctl restart`."
+
+#### 5. Activate
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start liquidation-bot
+sudo journalctl -u liquidation-bot -f   # watch first run
+
+# expect, in order:
+#   Resolving 1Password references against vault 'liquidation-bot'...
+#   Wrote .env (gitignored).
+#   docker-compose up --build
+#   liquidation-bot-1  | 2026-... - INFO - Initializing chains: [1]
+#   liquidation-bot-1  |  * Running on http://0.0.0.0:8080
+
+# verify it's healthy:
+sudo systemctl is-active liquidation-bot   # → active
+docker ps --filter name=liquidation-bot
+curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://localhost:8080/liquidation/allPositions?chainId=1
+
+# enable auto-start on boot (only after start succeeds):
+sudo systemctl enable liquidation-bot
+```
+
+#### Test crash and reboot resilience
+
+Pick a quiet window — these will briefly interrupt monitoring.
+
+```bash
+# A — bot crash auto-restarts (RestartSec=30s)
+sudo docker kill liquidation-bot-liquidation-bot-1
+sleep 35
+sudo systemctl is-active liquidation-bot   # → active
+
+# B — VM reboot survives
+sudo reboot
+# ssh back after the VM is up:
+sudo systemctl is-active liquidation-bot   # → active
+```
+
+#### Common first-run failures
+
+| Log message | Cause | Fix |
+|---|---|---|
+| `Failed at step CHDIR ... Permission denied` | `WorkingDirectory` under `/home/...` while `ProtectHome=true` is set | Remove `ProtectHome=true` (this README's unit already does) |
+| `op: command not found` | `op` not installed on the VM | Install per step 1 above |
+| `cannot prompt for confirmation` (from `op inject`) | `.env` already exists; without `--force`, op prompts and there's no TTY | The Makefile's `env-resolve` target uses `op inject --force` — pull the latest if you don't have it |
+| `docker: 'compose' is not a docker command` | Unit references `docker compose` (plugin) but VM only has standalone `docker-compose` | Set `ExecStop=/usr/local/bin/docker-compose down` (or vice versa for plugin-only VMs) |
+| `[ERROR] couldn't find vault 'liquidation-bot'` | Service Account token isn't scoped to that vault, or `OP_VAULT` differs | Check 1P UI → Service Accounts → vault scope; or set `Environment=OP_VAULT=<actual-name>` in the unit `[Service]` section |
+| Service is `active` but `docker ps` is empty for >2 min on first start | First-time image build is slow (uv sync + pip dependencies) | Wait. Use `sudo journalctl -u liquidation-bot -f` to watch build progress |
+
+#### Day-to-day commands
+
+```bash
+sudo systemctl status liquidation-bot       # current state
+sudo systemctl restart liquidation-bot      # apply a config / .env regenerate
+sudo systemctl stop liquidation-bot         # take it down
+sudo journalctl -u liquidation-bot -f       # live tail
+sudo journalctl -u liquidation-bot --since=today
+```
+
+To rotate a secret: update its value in 1Password, `sudo systemctl restart liquidation-bot`. The new value is fetched fresh on next start; no SSH'ing into the VM to edit files.
 
 ## How it works
 
@@ -96,14 +311,15 @@ To run locally, we need to install some dependencies and build the contracts. Th
 Setup:
 
 ```bash
-cp .env.example .env
+cp .env.example .env       # dev convenience only — throwaway keys, NEVER prod secrets
 foundryup
 uv sync
-cd redstone_script && pnpm install && cd ..
 forge install && forge build
 # cd lib/evk-periphery && forge build && cd ../..
 mkdir logs
 ```
+
+For the canonical prod-shaped local run that resolves secrets from 1Password (no `.env` on disk), use `make dev` instead of the steps above.
 
 **Run**:
 ```bash
@@ -112,10 +328,25 @@ uv run flask run --port 8080
 Change the Port number to whatever port is desired for exposing the relevant endpoints from the [routes.py](app/liquidation/routes.py) file.
 
 #### Docker
-After creating the .env file, the below command will create a container, install all dependencies, and start the liquidation bot:
-`docker compose build --progress=plain && docker compose up`
 
-This may require some configuration changes on the Docker image to a basic Python enabled container.
+Canonical entry point:
+
+```bash
+make run-docker
+```
+
+`run-docker` wraps `docker-compose up` in `op run` so all secrets (signing key, RPC URLs, API keys) are resolved from 1Password into the parent process environment and passed through to the container. No plaintext `.env` file is ever written to host disk by this path. Requirements:
+
+- `op` CLI installed and signed in, OR `OP_SERVICE_ACCOUNT_TOKEN` env var set in the calling shell (recommended for unattended prod hosts so the bot can restart unattended after a host reboot).
+- All keys in `.env.template` resolve against the configured `OP_VAULT` (defaults to `liquidation-bot`; override per-environment via `OP_VAULT=liquidation-bot-staging make run-docker`). Verify with `make verify-vault` before deploying.
+
+For one-off operator scripts that need the signing key (`sweep-liq-funds.sh`), wrap the same way:
+
+```bash
+op run --env-file=.env.template -- bash sweep-liq-funds.sh
+```
+
+NEVER copy `.env.example` to `.env` and run the bot with prod keys — `.env.example` is a dev-convenience template intended for throwaway keys against a fork RPC.
 
 ### Configuration
 

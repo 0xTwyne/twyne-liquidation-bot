@@ -2,13 +2,78 @@ services:
   liquidation-bot:
     build: .
     ports:
-      - 8080:8080
+      # Bind to loopback only: the sidecar reaches the bot over the internal
+      # compose network (http://liquidation-bot:8080); 8080 is exposed to
+      # localhost only for local debugging and the EC2 Nginx reverse proxy.
+      - 127.0.0.1:8080:8080
+    # Probe /health with a Python one-liner (slim image has no curl).
+    # start_period covers the 1-2 min startup EVC historical re-scan.
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     environment:
+      # Hardcoded plaintext config — not secrets, safe to commit.
       - LOGS_PATH=/app/logs/account_monitor_logs.log
-    env_file:
-      - .env
+      - SENTRY_ENVIRONMENT=production
+      - SENTRY_TRACES_SAMPLE_RATE=0.0
+      # Build provenance — set by the Makefile via `git rev-parse`.
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-unknown}
+      # Secrets — passed through from the calling shell, which is wrapped
+      # in `op run` by `make run-docker`. The plaintext values never land
+      # on host disk as a long-lived gitignored .env file. See Makefile
+      # `run-docker` target and `.env.template` for the resolution path.
+      - LIQUIDATOR_EOA
+      - LIQUIDATOR_PRIVATE_KEY
+      - MAINNET_RPC_URL
+      - ONEINCH_API_KEY
+      - SENTRY_DSN
+      - NOTIFICATION_URL
+      - RISK_DASHBOARD_URL
+      - SLACK_MENTION_IDS
+      - TWYNE_EOA_VAULTS
     user: "1000:1000"
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
+    restart: unless-stopped
+
+  # Sidecar: scrapes the bot's /internal/observability endpoint and ships
+  # custom metrics to CloudWatch (Twyne/liquidation-bot). Holds no secrets;
+  # uses the EC2 instance profile for cloudwatch:PutMetricData. The Dockerfile
+  # pins ENTRYPOINT ["flask","run"], so override entrypoint here to run the
+  # exporter module instead. Optional — remove this service if you do not
+  # ship metrics to CloudWatch.
+  metrics-exporter:
+    build: .
+    entrypoint: ["python", "-m", "app.observability.metrics_exporter"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    environment:
+      - AWS_REGION=eu-north-1
+      - METRICS_BOT_URL=http://liquidation-bot:8080/internal/observability
+      - METRICS_EXPORT_INTERVAL_SECONDS=60
+      # Local dev only — on EC2 these are unset and boto3 uses the instance
+      # profile via IMDS (requires instance metadata hop limit >= 2).
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+    user: "1000:1000"
+    depends_on:
+      liquidation-bot:
+        condition: service_healthy
     restart: unless-stopped

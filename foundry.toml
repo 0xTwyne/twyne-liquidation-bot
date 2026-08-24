@@ -12,26 +12,8 @@ lint_on_build = false
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
 
-[profile.base]
-# Defaults
-src = "src"
-out = "out"
-libs = ["lib"]
-
-optimizer = true
-optimizer_runs = 20_000
-solc = "0.8.28"
-
-evm_version = "Cancun"
-
-fs_permissions = [{ access = "read-write", path = "./"}]
-
-gas_reports = ["*"]
-# Settings for Base network
-eth_rpc_url = "https://gateway.tenderly.co/public/base"
-
 [profile.mainnet]
-# Defaults
+# Settings for Ethereum mainnet
 src = "src"
 out = "out"
 libs = ["lib"]
@@ -45,5 +27,18 @@ evm_version = "Cancun"
 fs_permissions = [{ access = "read-write", path = "./"}]
 
 gas_reports = ["*"]
-# Settings for Base network
+# Public fallback; override with FOUNDRY_ETH_RPC_URL env var for an
+# authenticated archive endpoint (the FOUNDRY_ prefix reliably overrides
+# eth_rpc_url; ${VAR} interpolation is NOT supported in foundry.toml).
+# Example: export FOUNDRY_ETH_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/...
 eth_rpc_url = "https://gateway.tenderly.co/public/mainnet"
+# fork_block_number intentionally omitted: tests query recently-deployed
+# contracts (e.g. HealthStatViewer, DEV-125) that do not exist at any fixed
+# historical block reachable via the public gateway. Pin once an authenticated
+# archive RPC (FOUNDRY_ETH_RPC_URL) is wired into CI.
+#
+# DEV-569: LiquidatorTest / AaveLiquidatorTest manufacture liquidatable vaults on a
+# live-protocol fork via test/LiquidationStateBuilder.sol. They self-fork at a pinned
+# block (LiquidationStateBuilder.FORK_BLOCK) using FOUNDRY_ETH_RPC_URL, falling back to
+# a public archive RPC (eth.drpc.org) when unset. CI SHOULD set FOUNDRY_ETH_RPC_URL to
+# an authenticated archive endpoint for determinism and to avoid public-RPC rate limits.

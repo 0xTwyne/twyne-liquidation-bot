@@ -20,21 +20,22 @@ jobs:
       matrix:
         python-version:
         - "3.11"
+        - "3.13"
         os: [ubuntu-22.04,]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
         with:
           submodules: recursive
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
         with:
-          version: nightly
+          version: v1.7.1
       - name: Run Forge build
         run: |
           forge --version
@@ -42,10 +43,28 @@ jobs:
         id: build
       - name: Install Packages
         run: |
-          uv sync
+          uv sync --frozen
       - name: Lint
         run: |
           uv run make lint
       - name: Tests
+        env:
+          # MAINNET_RPC_URL: used by the Python config loader (ChainConfig) at
+          # test time for chain 1. Falls back to the public Tenderly gateway
+          # when the secret is not set (e.g. in forks / external contributors).
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL || 'https://gateway.tenderly.co/public/mainnet' }}
+          # FOUNDRY_ETH_RPC_URL: overrides eth_rpc_url in foundry.toml via the
+          # FOUNDRY_ prefix (toml ${VAR} interpolation is not supported).
+          # Same value as MAINNET_RPC_URL; set to an authenticated archive
+          # endpoint via the secret when available.
+          FOUNDRY_ETH_RPC_URL: ${{ secrets.MAINNET_RPC_URL || 'https://gateway.tenderly.co/public/mainnet' }}
         run: |
           uv run make tests
+
+  docker-build:
+    name: Docker image smoke build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+      - name: Build Docker image
+        run: docker build --no-cache -t liquidation-bot:ci-test .
