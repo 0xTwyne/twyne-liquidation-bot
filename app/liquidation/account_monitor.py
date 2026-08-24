@@ -23,7 +23,6 @@ from app.liquidation.notifications import (
     post_low_health_account_report_notification,
     post_unhealthy_account_notification,
 )
-from app.liquidation.profitability import should_skip_usds_liquidation
 from app.liquidation.vaults.base_vault import HF_ONE, BaseCollateralVault, BaseLiquidator
 from app.liquidation.vaults.registry import get_vault_class_for_protocol
 
@@ -302,21 +301,8 @@ class AccountMonitor:
             prev_scheduled_time = account.time_of_next_update
 
             [internal_health_score, external_health_score, externally_liquidated] = account.update_liquidity()
-            # Skip *liquidating* USDS-debt positions on Base, but keep them on the normal
-            # monitoring cadence. This previously did an early `return`, which also skipped
-            # the re-queue at the end of this method and orphaned the account from the
-            # priority queue until the hourly stale sweep (DEV-553 / finding B11). Scoped to
-            # chain 8453 to match the original "on Base" intent — USDS_ADDRESS is a single
-            # global config value applied across all chains.
-            skip_usds_liquidation = should_skip_usds_liquidation(
-                self.chain_id, account.target_asset, self.config.USDS_ADDRESS
-            )
 
-            if skip_usds_liquidation:
-                logger.info(
-                    "AccountMonitor: Skipping liquidation of USDS-debt position %s on Base (still monitored)", address
-                )
-            elif (
+            if (
                 account.internal_health_score_raw < HF_ONE
                 or account.external_health_score_raw < HF_ONE
                 or externally_liquidated

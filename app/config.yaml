@@ -78,8 +78,6 @@ global:
   # API Retry
   RETRY_DELAY: 10
 
-  ## ADDRESSES ##
-  USDS_ADDRESS: "0x820C137fa70C8691f0e44Dc420a5e53c168921Dc"
   ## TWYNE_EOA_VAULTS and SLACK_MENTION_IDS are loaded from environment variables.
   ## See .env.example for configuration.
 

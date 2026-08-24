@@ -5,7 +5,7 @@ Covers two functions in euler_vault:
 * `_calculate_external_profit` — pure profit math for an externally-liquidated
   vault: ``liquidator_reward_usd - debt_value``.
 * `EulerLiquidator.calculate_liquidation_profit` — the early-return decision
-  ladder (USDS skip, not-liquidatable, ext-liq-no-credit, no-collateral-seized,
+  ladder (not-liquidatable, ext-liq-no-credit, no-collateral-seized,
   negative internal profit gate) plus the positive-profit delegation to
   `_build_liquidation_tx` (mocked out, since its USD/gas gate is covered by
   test_euler_internal_liquidation.py).
@@ -20,7 +20,6 @@ from app.liquidation.vaults import euler_vault
 from app.liquidation.vaults.euler_vault import EulerLiquidator
 
 LIQUIDATOR_EOA = "0xA94D9d3b3f2A69559E89ea05B91940166382E23a"
-USDS = "0xdC035D45d973E3EC169d2276DDab16f1e407384F"
 VAULT = "0x97a2B0FA27A1865FFCB730738Ba07e4BBf700720"
 COLLATERAL_ASSET = "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
 UNDERLYING_ASSET = "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"
@@ -36,8 +35,8 @@ def _quote(value):
     return q
 
 
-def _config(*, usds=USDS, liquidator_eoa=LIQUIDATOR_EOA):
-    return SimpleNamespace(USDS_ADDRESS=usds, LIQUIDATOR_EOA=liquidator_eoa)
+def _config(*, liquidator_eoa=LIQUIDATOR_EOA):
+    return SimpleNamespace(LIQUIDATOR_EOA=liquidator_eoa)
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +139,6 @@ def _vault(
     if debt_value is not None:
         v.target_vault.functions.accountLiquidity.return_value.call.return_value = (0, debt_value)
     return v
-
-
-def test_skips_usds_debt_position():
-    # target_asset matches USDS case-insensitively → ({"profit": 0}, None)
-    vault = _vault(target_asset=USDS.lower())
-    result = EulerLiquidator.calculate_liquidation_profit(vault, _config(usds=USDS.upper()))
-    assert result == ({"profit": 0}, None)
-    vault.check_liquidation.assert_not_called()
 
 
 def test_not_liquidatable_returns_zero():

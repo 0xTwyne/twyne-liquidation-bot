@@ -162,14 +162,6 @@ class EulerLiquidator(BaseLiquidator):
         collateral_asset = vault.underlying_asset_address
         borrowed_asset = vault.target_asset
 
-        # NOTE: intentionally NOT chain-scoped (unlike account_monitor's
-        # should_skip_usds_liquidation). The existing tests exercise this skip with a
-        # mainnet USDS address, so scoping to chain 8453 here would change behavior
-        # (DEV-557 R5 RESTRAINT). Left as the original global == check.
-        if borrowed_asset.lower() == config.USDS_ADDRESS.lower():
-            logger.info("Liquidator: Skipping position with USDS debt on Base")
-            return (False, None, None)
-
         try:
             logger.info(
                 "Liquidator: Simulating liquidation for %s (borrowed=%s, collateral=%s)",
@@ -236,14 +228,6 @@ class EulerLiquidator(BaseLiquidator):
             Tuple of (profit_data_dict, params_tuple or None).
         """
         collateral_asset = collateral_vault.underlying_asset_address
-        target_asset = collateral_vault.target_asset
-
-        # NOTE: intentionally NOT chain-scoped (see simulate_liquidation above) —
-        # scoping to chain 8453 would change behavior the existing tests rely on
-        # (DEV-557 R5 RESTRAINT).
-        if target_asset.lower() == config.USDS_ADDRESS.lower():
-            logger.info("Skipping USDS debt position for %s", collateral_vault.address)
-            return ({"profit": 0}, None)
 
         # Check liquidation status
         (can_liquidate, externally_liquidated, max_release, max_repay, total_assets) = (

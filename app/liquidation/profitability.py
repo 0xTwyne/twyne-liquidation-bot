@@ -32,21 +32,6 @@ USD = 10**18
 # loss in order to clear a liquidatable position (dust / bad-debt cleanup).
 _DEFAULT_MIN_NET_PROFIT_USD = float(os.environ.get("LIQ_MIN_NET_PROFIT_USD", "0"))
 
-# Base chain id — USDS-debt positions are skipped for *liquidation* only on Base.
-_BASE_CHAIN_ID = 8453
-
-
-def should_skip_usds_liquidation(chain_id: int, target_asset: str, usds_address: str) -> bool:
-    """Whether a position's liquidation should be skipped because it is USDS debt on Base.
-
-    USDS-debt positions on Base (chain 8453) must skip *liquidation* while remaining on
-    the normal monitoring cadence (DEV-553). The scope is intentionally Base-only:
-    ``usds_address`` is a single global config value applied across all chains, so a
-    mainnet target asset can never equal the Base USDS address in practice, but pinning
-    the predicate to chain 8453 keeps the "on Base" intent explicit.
-    """
-    return chain_id == _BASE_CHAIN_ID and target_asset.lower() == usds_address.lower()
-
 
 def value_in_usd(oracle_router, amount: int, token: str, unit_of_account: str) -> int:
     """Value ``amount`` of ``token`` in the unit of account (USD, 1e18-scaled).

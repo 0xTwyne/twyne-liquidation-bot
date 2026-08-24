@@ -12,11 +12,8 @@ pricing chains to prove the consolidated arithmetic is identical to the original
 import pytest
 
 from app.liquidation.constants import ONEINCH_MIN_RETURN_END, ONEINCH_MIN_RETURN_OFFSET
-from app.liquidation.profitability import external_release_and_c_new, should_skip_usds_liquidation
+from app.liquidation.profitability import external_release_and_c_new
 from app.liquidation.swap_1inch import decode_1inch_min_return
-
-BASE_USDS = "0x820C137fa70C8691f0e44Dc420a5e53c168921Dc"
-OTHER_ASSET = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
 
 
 def _swap_calldata(min_return: int, total_len: int = ONEINCH_MIN_RETURN_END) -> bytes:
@@ -106,23 +103,3 @@ def test_release_user_collateral_equals_balance_zero_release():
     )
     assert release_amount == 0
     assert c_new == 1_000
-
-
-# --- should_skip_usds_liquidation -------------------------------------------
-
-
-def test_usds_skip_on_base_matching_target():
-    assert should_skip_usds_liquidation(8453, BASE_USDS, BASE_USDS) is True
-
-
-def test_usds_skip_on_base_case_insensitive():
-    assert should_skip_usds_liquidation(8453, BASE_USDS.lower(), BASE_USDS.upper()) is True
-
-
-def test_usds_no_skip_on_base_other_target():
-    assert should_skip_usds_liquidation(8453, OTHER_ASSET, BASE_USDS) is False
-
-
-def test_usds_no_skip_on_mainnet_even_if_target_matches():
-    # Scoped to Base (8453): a chain-1 position is never skipped by this predicate.
-    assert should_skip_usds_liquidation(1, BASE_USDS, BASE_USDS) is False
