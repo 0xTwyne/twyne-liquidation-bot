@@ -168,6 +168,12 @@ class ChainConfig:
         self.AAVE_LIQUIDATOR_ADDRESS = Web3.to_checksum_address(
             os.environ.get("AAVE_LIQUIDATOR_OVERRIDE") or self.AAVE_LIQUIDATOR_ADDRESS
         )
+        # HealthStatViewer address override (DEV-661 e2e): the fork harness deploys the
+        # lens that matches the contracts on the fork and points the bot at it. In
+        # production the address comes from config.yaml.
+        self.HEALTHSTATVIEWER_ADDRESS = Web3.to_checksum_address(
+            os.environ.get("HEALTHSTATVIEWER_OVERRIDE") or self.HEALTHSTATVIEWER_ADDRESS
+        )
         # Optional deployment-block override (e2e: narrows the FactoryListener startup
         # scan to the fork's post-base blocks so only the seeded CV is discovered).
         _dep_override = os.environ.get("CVAULT_FACTORY_DEPLOYMENT_BLOCK_OVERRIDE")

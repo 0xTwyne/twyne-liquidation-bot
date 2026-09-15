@@ -9,17 +9,32 @@ import {IEulerCollateralVault} from "contracts/IEulerCollateralVault.sol";
 import {MockPriceOracle} from "contracts/MockPriceOracle.sol";
 import {MockAaveFeed, IAggregator} from "./MockAaveFeed.sol";
 
-/// @notice Minimal view of the deployed Twyne CollateralVaultFactory (live V3 ABI).
+/// @notice Minimal view of the deployed Twyne CollateralVaultFactory (1.0.7).
+/// @dev 1.0.7 replaces the single `createCollateralVault(uint8,...)` with one function per
+///      collateral vault type, and replaces the boolean `paused()` with a three-state
+///      `pauseState()` (0 Active, 1 Frozen, 2 Paused).
 interface ICollateralVaultFactory {
-    function createCollateralVault(
-        uint8 _vaultType,
+    function createEulerCollateralVault(address _intermediateVault, address _targetVault, uint256 _liqLTV)
+        external
+        returns (address);
+    function createAaveV3CollateralVault(
         address _intermediateVault,
         address _targetVault,
         uint256 _liqLTV,
         address _targetAsset
     ) external returns (address);
     function isCollateralVault(address) external view returns (bool);
+    function pauseState() external view returns (uint8);
     function EVC() external view returns (address);
+}
+
+/// @notice Twyne 1.0.7 collateral vault deposit surface, shared by the Euler and the Aave vault.
+/// @dev `depositUnderlying` is gone. `deposit` pulls the RECEIPT token (eVault shares for an
+///      Euler vault, aToken-wrapper shares for an Aave vault) from the borrower, so the borrower
+///      wraps the underlying first. `skim` books receipt tokens that were sent to the vault.
+interface ITwyneCollateralVault {
+    function deposit(uint256 assets) external;
+    function skim() external;
 }
 
 /// @notice Minimal view of an Euler price-oracle router (euler-price-oracle EulerRouter).
@@ -30,10 +45,14 @@ interface IEulerRouter {
     function getQuote(uint256 inAmount, address base, address quote) external view returns (uint256);
 }
 
-/// @notice Minimal view of the deployed Twyne VaultManager (live V3 ABI).
+/// @notice Minimal view of the deployed Twyne VaultManager (1.0.7).
+/// @dev 1.0.7 keys the liquidation parameters on (intermediateVault, targetAsset) and removes
+///      `oracleRouter()`; the router is now the intermediate vault's `oracle()`.
 interface IVaultManager {
-    function oracleRouter() external view returns (address);
-    function maxTwyneLTVs(address intermediateVault) external view returns (uint16 maxTwyneLiqLTV);
+    function liqParams(address intermediateVault, address targetAsset)
+        external
+        view
+        returns (uint16 externalLiqBuffer, uint16 maxTwyneLiqLTV, uint16 borrowBuffer);
 }
 
 /// @notice Minimal Aave V3 Pool view for manufacturing/seizing external positions.
@@ -61,7 +80,6 @@ interface IAaveOracle {
 
 /// @notice Minimal Twyne Aave collateral vault view (live V3 ABI).
 interface IAaveCV {
-    function depositUnderlying(uint256 underlying) external;
     function borrow(uint256 targetAmount, address receiver) external;
     function canLiquidate() external view returns (bool);
     function isExternallyLiquidated() external view returns (bool);
@@ -111,18 +129,30 @@ abstract contract LiquidationStateBuilder is Test {
 
     address internal constant USD = address(840); // unit of account
 
-    uint8 internal constant VAULT_TYPE_EULER = 0; // CollateralVaultFactory.VaultType.EULER_V2
-    uint8 internal constant VAULT_TYPE_AAVE = 1; // CollateralVaultFactory.VaultType.AAVE_V3
 
     /// @notice Pinned recent fork block where the V3 protocol + Aave integration are deployed and the
     ///         deployed ABI matches the interfaces below. See foundry.toml / docs for the archive-RPC note.
-    uint256 internal constant FORK_BLOCK = 25_340_000;
     /// @dev Public archive RPC used when FOUNDRY_ETH_RPC_URL is unset (e.g. local `forge test`).
     string internal constant DEFAULT_FORK_RPC = "https://eth.drpc.org";
 
-    /// @notice Select a mainnet fork at FORK_BLOCK using FOUNDRY_ETH_RPC_URL (archive) or a public default.
+    /// @notice Select a mainnet fork with FOUNDRY_ETH_RPC_URL (archive) or a public default.
+    /// @dev Forks the LATEST block, because the fixture builds its state from live protocol
+    ///      reads and Twyne 1.0.7 is newer than any pinned block. Set FOUNDRY_FORK_BLOCK to pin
+    ///      a block. The fixture needs a chain on 1.0.7: point FOUNDRY_ETH_RPC_URL at an anvil
+    ///      fork with Safe nonce 29 applied until the upgrade is live on mainnet.
     function _forkMainnet() internal {
-        vm.createSelectFork(vm.envOr("FOUNDRY_ETH_RPC_URL", DEFAULT_FORK_RPC), FORK_BLOCK);
+        string memory rpc = vm.envOr("FOUNDRY_ETH_RPC_URL", DEFAULT_FORK_RPC);
+        uint256 pinnedBlock = vm.envOr("FOUNDRY_FORK_BLOCK", uint256(0));
+        if (pinnedBlock == 0) {
+            vm.createSelectFork(rpc);
+        } else {
+            vm.createSelectFork(rpc, pinnedBlock);
+        }
+
+        (bool ok,) = VAULT_MANAGER.staticcall(
+            abi.encodeWithSignature("liqParams(address,address)", address(0), address(0))
+        );
+        require(ok, "chain is not on Twyne 1.0.7 (VaultManager.liqParams missing): use an upgraded fork");
     }
 
     /// @notice Bundle of addresses describing a freshly-created CV under construction.
@@ -141,7 +171,7 @@ abstract contract LiquidationStateBuilder is Test {
 
     /// @notice Create a fresh Euler-backed CV against the live factory and open a borrow position.
     /// @param borrower account that owns the CV
-    /// @param liqLTV Twyne liquidation LTV (1e4) — must be <= live maxTwyneLTVs(IV)
+    /// @param liqLTV Twyne liquidation LTV (1e4) — must be <= live liqParams(IV, targetAsset).maxTwyneLiqLTV
     /// @param collateralUnderlying amount of WETH the borrower deposits as collateral
     /// @param borrowAmount amount of USDC to borrow (must be within capacity)
     function _createEulerCV(address borrower, uint16 liqLTV, uint256 collateralUnderlying, uint256 borrowAmount)
@@ -160,21 +190,24 @@ abstract contract LiquidationStateBuilder is Test {
 
         // Create the CV from the live factory (permissionless).
         vm.prank(borrower);
-        h.cv = ICollateralVaultFactory(FACTORY)
-            .createCollateralVault(VAULT_TYPE_EULER, IV_EULER_EWETH, EULER_USDC, liqLTV, address(0));
+        h.cv = ICollateralVaultFactory(FACTORY).createEulerCollateralVault(IV_EULER_EWETH, EULER_USDC, liqLTV);
         vm.label(h.cv, "collateralVault");
         require(ICollateralVaultFactory(FACTORY).isCollateralVault(h.cv), "factory did not register CV");
 
-        // Deposit collateral (underlying WETH, wrapped to eulerWETH by the CV) + borrow, in one EVC batch.
+        // Twyne 1.0.7: the CV pulls eulerWETH shares, so the borrower wraps the WETH first.
         deal(WETH, borrower, collateralUnderlying);
         vm.startPrank(borrower);
-        IERC20(WETH).approve(h.cv, type(uint256).max);
+        IERC20(WETH).approve(h.collateralAsset, type(uint256).max);
+        uint256 collateralShares = IEVault(h.collateralAsset).deposit(collateralUnderlying, borrower);
+
+        // Deposit the collateral shares + borrow, in one EVC batch.
+        IERC20(h.collateralAsset).approve(h.cv, type(uint256).max);
         IEVC.BatchItem[] memory items = new IEVC.BatchItem[](2);
         items[0] = IEVC.BatchItem({
             targetContract: h.cv,
             onBehalfOfAccount: borrower,
             value: 0,
-            data: abi.encodeCall(IEulerCollateralVault.depositUnderlying, (collateralUnderlying))
+            data: abi.encodeCall(ITwyneCollateralVault.deposit, (collateralShares))
         });
         items[1] = IEVC.BatchItem({
             targetContract: h.cv,
@@ -263,20 +296,25 @@ abstract contract LiquidationStateBuilder is Test {
         _topUpAaveIV(IV_AAVE_AWSTETH, AWSTETH_WRAPPER, WSTETH);
 
         vm.prank(borrower);
-        h.cv = ICollateralVaultFactory(FACTORY)
-            .createCollateralVault(VAULT_TYPE_AAVE, IV_AAVE_AWSTETH, AAVE_POOL, liqLTV, WETH);
+        h.cv = ICollateralVaultFactory(FACTORY).createAaveV3CollateralVault(
+            IV_AAVE_AWSTETH, AAVE_POOL, liqLTV, WETH
+        );
         vm.label(h.cv, "aaveCollateralVault");
         require(ICollateralVaultFactory(FACTORY).isCollateralVault(h.cv), "factory did not register Aave CV");
 
+        // Twyne 1.0.7: the CV pulls aToken-wrapper shares, so the borrower wraps the wstETH first.
         deal(WSTETH, borrower, collateralUnderlying);
         vm.startPrank(borrower);
-        IERC20(WSTETH).approve(h.cv, type(uint256).max);
+        IERC20(WSTETH).approve(h.collateralAsset, type(uint256).max);
+        uint256 collateralShares = IEVault(h.collateralAsset).deposit(collateralUnderlying, borrower);
+
+        IERC20(h.collateralAsset).approve(h.cv, type(uint256).max);
         IEVC.BatchItem[] memory items = new IEVC.BatchItem[](2);
         items[0] = IEVC.BatchItem({
             targetContract: h.cv,
             onBehalfOfAccount: borrower,
             value: 0,
-            data: abi.encodeCall(IAaveCV.depositUnderlying, (collateralUnderlying))
+            data: abi.encodeCall(ITwyneCollateralVault.deposit, (collateralShares))
         });
         items[1] = IEVC.BatchItem({
             targetContract: h.cv,

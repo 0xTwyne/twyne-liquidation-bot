@@ -24,6 +24,8 @@ from typing import Any, List, Optional
 from eth_abi import encode as abi_encode
 from web3 import Web3
 
+from app.liquidation.errors import describe_revert
+
 # Minimal ERC20 ABI for balance probing / reads.
 _ERC20_ABI = [
     {
@@ -163,8 +165,21 @@ class AnvilFork:
             self.stop_impersonate(frm)
         rcpt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         if rcpt["status"] != 1:
-            raise RuntimeError(f"tx reverted: from={frm} to={to} data={data[:10]}")
+            raise RuntimeError(f"tx reverted: from={frm} to={to} data={data[:10]}{self._revert_reason(tx, rcpt)}")
         return rcpt
+
+    def _revert_reason(self, tx: dict, rcpt) -> str:
+        """Replay a reverted tx as an eth_call to recover the revert data.
+
+        A receipt carries no revert reason, so the same call is repeated against the
+        block that mined it. Returns a printable suffix, or an empty string when the
+        replay gives nothing.
+        """
+        try:
+            self.rpc("eth_call", [{k: v for k, v in tx.items() if k != "gas"}, hex(rcpt["blockNumber"] - 1)])
+        except Exception as ex:  # noqa: BLE001 - diagnostics only
+            return f" reason={describe_revert(ex) or ex}"
+        return " reason=unavailable (the replay did not revert)"
 
     def deploy(self, deployer: str, creation_hex: str, gas: int = 12_000_000) -> str:
         """Deploy a contract from creation bytecode; return the deployed address."""

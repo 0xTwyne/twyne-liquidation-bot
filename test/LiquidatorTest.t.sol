@@ -19,7 +19,7 @@ contract LiquidatorTest is LiquidationStateBuilder {
     address borrower;
 
     // Sizing for the manufactured Euler CV (small: the live eWETH IV has a ~7 eWETH supply cap).
-    uint16 constant LIQ_LTV = 9400; // <= live maxTwyneLTVs(eWETH IV) == 9400
+    uint16 constant LIQ_LTV = 9400; // <= live liqParams(eWETH IV, USDC).maxTwyneLiqLTV == 9400
     uint256 constant COLLATERAL_WETH = 5 ether;
     uint256 constant BORROW_USDC = 5000e6;
 

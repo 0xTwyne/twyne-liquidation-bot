@@ -17,14 +17,6 @@ import {MockSwapper} from "./MockSwapper.sol";
 interface ICollateralVaultFactory {
     function isCollateralVault(address collateralVault) external view returns (bool);
     function EVC() external view returns (address);
-    function createCollateralVault(
-        uint8 _vaultType,
-        address _asset,
-        address _targetVault,
-        uint256 _liqLTV,
-        address _targetAsset
-    ) external returns (address);
-    function paused() external view returns (bool);
     function setCategoryId(address targetVault, address asset, address targetAsset, uint8 categoryId) external;
 }
 
@@ -46,15 +38,6 @@ interface IEVC {
     function enableController(address account, address vault) external;
     function enableCollateral(address account, address vault) external;
     function batch(BatchItem[] calldata items) external;
-}
-
-interface IVaultManager {
-    function setMaxLiquidationLTV(address collateralAsset, uint16 maxLTV) external;
-    function setExternalLiqBuffer(address collateralAsset, uint16 buffer) external;
-    function externalLiqBuffers(address collateralAsset) external view returns (uint16);
-    function maxTwyneLTVs(address collateralAsset) external view returns (uint16);
-    function getIntermediateVault(address collateralAsset) external view returns (address);
-    function setAllowedTargetAsset(address intermediateVault, address targetVault, address targetAsset) external;
 }
 
 interface IAaveV3Pool {
@@ -98,7 +81,8 @@ contract AaveLiquidatorTest is LiquidationStateBuilder {
     address borrower;
 
     // Sizing for the manufactured Aave CV (wstETH collateral, WETH debt).
-    uint16 constant AAVE_LIQ_LTV = 9800; // == live maxTwyneLTVs(awstETH IV); > external eMode LT (9500) so the CV reserves credit
+    // == live liqParams(awstETH IV, WETH).maxTwyneLiqLTV; > external eMode LT (9500), so the CV reserves credit
+    uint16 constant AAVE_LIQ_LTV = 9800;
     uint256 constant AAVE_COLLATERAL_WSTETH = 2 ether;
     uint256 constant AAVE_BORROW_WETH = 1 ether;
 

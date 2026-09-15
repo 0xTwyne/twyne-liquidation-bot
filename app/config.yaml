@@ -97,9 +97,19 @@ chains:
     contracts:
       # Twyne
       CVAULT_FACTORY: "0xa1517cCe0bE75700A8838EA1cEE0dc383cd3A332"
-      HEALTHSTATVIEWER_ADDRESS: "0x5A919b9A77ee391AB48208A93e0684c24F99B07a"
+      # HealthStatViewer for Twyne 1.0.7 (DEV-660). The previous lens
+      # 0x5A919b9A77ee391AB48208A93e0684c24F99B07a reads the VaultManager getters that
+      # 1.0.7 removes, so it reverts for every vault after the upgrade.
+      HEALTHSTATVIEWER_ADDRESS: "0xf88A9f96fa0798Ed322CD0e60435e4F111059DEf"
       EULER_LIQUIDATOR_ADDRESS: "0x01A7D8Cb49530721d59D256dB8807EB4720c1AED"
       AAVE_LIQUIDATOR_ADDRESS: "0x13B0BBa0173F62aF9891784A2CF57ab2C0Ec528f"
+      # Router used to price the target asset and WETH in USD for the profit gate of an
+      # Aave collateral vault. Twyne 1.0.7 removed VaultManager.oracleRouter(), and the
+      # router of the Aave intermediate vault prices the aToken wrapper but not the raw
+      # tokens. Source: tech-notes public-launch-addresses/TwyneAddresses_current_1.json,
+      # key "eulerOracleRouter". Remove the key to fall back to the intermediate vault's
+      # own oracle().
+      ORACLE_ROUTER_ADDRESS: "0xb001f039D76bA48E577A17c04b6940DB37aF8648"
       AAVE_POOL: "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
 
       #EVK Addresses

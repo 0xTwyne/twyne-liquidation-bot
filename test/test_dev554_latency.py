@@ -101,6 +101,10 @@ class _MockVault(BaseCollateralVault):
         # overwrites them from the health() mock during the tick.
         self.internal_health_score_raw = math.inf
         self.external_health_score_raw = math.inf
+        # DEV-661 health-unknown bookkeeping, same start state as production.
+        self.health_read_failures = 0
+        self.health_unknown = False
+        self._health_unknown_alerted_at = None
         self.internal_value_borrowed = 0
         self.external_value_borrowed = 0
         self.underlying_asset_address = None
@@ -296,8 +300,6 @@ def _euler_metadata():
         "unit_of_account": "0x" + "a6" * 20,
         "vault_manager_address": "0x" + "a7" * 20,
         "oracle_router_address": "0x" + "a8" * 20,
-        "vault_name": "Twyne CV",
-        "vault_symbol": "tCV",
     }
 
 

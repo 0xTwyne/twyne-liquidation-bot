@@ -14,6 +14,7 @@ from web3 import Web3
 from web3.exceptions import TimeExhausted, TransactionNotFound
 
 from app.liquidation.config_loader import ChainConfig
+from app.liquidation.errors import describe_revert
 from app.liquidation.logging_config import setup_logger
 from app.liquidation.notifications import post_error_notification
 
@@ -24,6 +25,13 @@ from app.liquidation.notifications import post_error_notification
 LIQ_MAX_SUBMIT_ATTEMPTS = int(os.environ.get("LIQ_MAX_SUBMIT_ATTEMPTS", "3"))
 LIQ_FEE_BUMP_FACTOR = float(os.environ.get("LIQ_FEE_BUMP_FACTOR", "1.50"))
 LIQ_RECEIPT_TIMEOUT_SECS = int(os.environ.get("LIQ_RECEIPT_TIMEOUT_SECS", "60"))
+
+# Number of consecutive HealthStatViewer.health() failures after which a vault moves
+# to the explicit `health_unknown` state (DEV-661). One or two failures are transient
+# (an RPC hiccup), and the vault keeps its last known health. More than that means the
+# bot cannot see the position at all — the usual cause is a lens that reverts for every
+# vault after a protocol upgrade. Such a vault must never look healthy.
+HEALTH_UNKNOWN_FAILURE_THRESHOLD = int(os.environ.get("HEALTH_UNKNOWN_FAILURE_THRESHOLD", "3"))
 
 logger = setup_logger()
 
@@ -89,6 +97,14 @@ class BaseCollateralVault(ABC):
         # math.inf sentinel as the floats, so an un-read vault is treated as healthy.
         self.internal_health_score_raw = math.inf
         self.external_health_score_raw = math.inf
+        # Explicit "the bot does not know this vault's health" state (DEV-661). The
+        # health factors above fall back to math.inf on a failed read, which reads as
+        # "healthy" everywhere else in the bot. `health_unknown` separates the two, so
+        # a lens that reverts for every vault raises an alert and still opens the
+        # on-chain liquidation check instead of showing a healthy fleet.
+        self.health_read_failures = 0
+        self.health_unknown = False
+        self._health_unknown_alerted_at: "float | None" = None
         self.balance = 0
         self.internal_value_borrowed = 0
         self.external_value_borrowed = 0
@@ -181,6 +197,24 @@ class BaseCollateralVault(ABC):
             # Return safe defaults - will be checked again on next update
             return (False, False, 0, 0, 0)
 
+    def get_liq_params(self) -> Tuple[int, int, int]:
+        """Read the liquidation parameters of this vault from the VaultManager.
+
+        Twyne 1.0.7 keys them on (intermediateVault, targetAsset) and returns
+        (externalLiqBuffer, maxTwyneLiqLTV, borrowBuffer), all in 1e4 precision. The
+        one-argument getters of the earlier VaultManager do not exist any more.
+        `intermediate_vault_address` and `target_asset` are immutable per vault and are
+        read once at init, so this is a single eth_call.
+        """
+        buffer_, max_twyne_liq_ltv, borrow_buffer = self.vault_manager.functions.liqParams(
+            self.intermediate_vault_address, self.target_asset
+        ).call()
+        return (buffer_, max_twyne_liq_ltv, borrow_buffer)
+
+    def get_max_twyne_ltv(self) -> int:
+        """Effective maxTwyneLiqLTV (1e4) of this vault's (intermediate vault, target asset) pair."""
+        return self.get_liq_params()[1]
+
     def get_health_score(self) -> Tuple[float, float]:
         try:
             externalHF, internalHF, external_liability_value, internal_liability_value = (
@@ -233,10 +267,57 @@ class BaseCollateralVault(ABC):
             )
             if self.internal_health_score < 1 or self.external_health_score < 1:
                 logger.info("  +++++=====Vault: %s can be liquidated!", self.address)
+            self._mark_health_known()
             return (internalHF, externalHF)
         except Exception as ex:
             logger.error("Vault: Failed to get health score for %s: %s", self.address, ex, exc_info=True)
+            self._record_health_failure(ex)
             return (math.inf, math.inf)
+
+    def _mark_health_known(self) -> None:
+        """Clear the failure counter after a successful health() read."""
+        recovered = self.health_unknown and self._health_unknown_alerted_at is not None
+        failures = self.health_read_failures
+        self.health_read_failures = 0
+        self.health_unknown = False
+        self._health_unknown_alerted_at = None
+        if recovered:
+            logger.warning("Vault: %s health read recovered after %s failures", self.address, failures)
+            post_error_notification(
+                f"*Health read recovered* for collateral vault `{self.address}` ({self.protocol}) "
+                f"after {failures} consecutive failures.",
+                self.config,
+            )
+
+    def _record_health_failure(self, ex: Exception) -> None:
+        """Count a failed health() read and mark the vault health_unknown if they repeat.
+
+        Below the threshold the vault keeps its last known health, which is the old
+        behaviour for a transient RPC failure. At the threshold the vault becomes
+        health_unknown and the bot alerts. The alert repeats at most once per
+        ERROR_COOLDOWN so a fleet-wide lens failure does not flood the channel.
+        """
+        self.health_read_failures += 1
+        if self.health_read_failures < HEALTH_UNKNOWN_FAILURE_THRESHOLD:
+            return
+
+        self.health_unknown = True
+        now = time.time()
+        cooldown = getattr(self.config, "ERROR_COOLDOWN", 900)
+        last_alert = self._health_unknown_alerted_at
+        if last_alert is not None and now - last_alert < cooldown:
+            return
+
+        self._health_unknown_alerted_at = now
+        viewer = getattr(self.config, "HEALTHSTATVIEWER_ADDRESS", "unknown")
+        post_error_notification(
+            f"*Health UNKNOWN* for collateral vault `{self.address}` ({self.protocol}): "
+            f"{self.health_read_failures} consecutive HealthStatViewer.health() failures. "
+            f"Viewer: `{viewer}`. Last error: {ex}. "
+            "This vault is NOT known to be healthy. Check that the HealthStatViewer address "
+            "matches the deployed Twyne contract version.",
+            self.config,
+        )
 
     def get_position_stats(self):
         """Fetch full position stats from HealthStatViewer.positionStats().
@@ -422,6 +503,11 @@ class BaseCollateralVault(ABC):
             "time_of_next_update": self.time_of_next_update,
             "internal_health_score": self.internal_health_score,
             "external_health_score": self.external_health_score,
+            # True while repeated health() reads fail. Surfaced through the API so an
+            # operator sees "unknown" instead of a health score that is really a
+            # fallback value (DEV-661). Not restored by from_dict: the first tick
+            # after a restart re-evaluates it.
+            "health_unknown": self.health_unknown,
             # Derived state — persisted for offline tooling (pair_audit) and
             # surfacing through the API. Recomputed every time the vault is
             # reconstructed via from_dict, so a stale persisted value cannot
@@ -586,7 +672,7 @@ class BaseLiquidator(ABC):
                         return h_hex, rcpt
                 return None, None
             except Exception as ex:
-                message = f"Unexpected error in executing liquidation: {ex}"
+                message = f"Unexpected error in executing liquidation: {ex}{describe_revert(ex)}"
                 logger.error(message, exc_info=True)
                 # The send may have broadcast at `nonce` before this error (e.g. a
                 # receipt-wait connection drop). Force a chain re-seed on the next

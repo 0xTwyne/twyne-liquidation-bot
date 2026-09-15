@@ -39,8 +39,6 @@ USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 USD = "0x0000000000000000000000000000000000000348"  # address(840)
 ZERO = "0x0000000000000000000000000000000000000000"
 
-VAULT_TYPE_EULER = 0
-VAULT_TYPE_AAVE = 1
 MAX_UINT = 2**256 - 1
 
 # ---- minimal ABI fragments (reads) ----------------------------------------------
@@ -186,6 +184,21 @@ class StateSeeder:
             encode_call("deposit(uint256,address)", ["uint256", "address"], [amount, Web3.to_checksum_address(to)]),
         )
 
+    def _wrap_for_borrower(self, borrower, share_token, underlying, underlying_amount) -> int:
+        """Give the borrower `underlying_amount` of the underlying and wrap it into shares.
+
+        Twyne 1.0.7 removed `depositUnderlying` from the collateral vault: `deposit` pulls
+        the receipt token (eVault shares or aToken-wrapper shares) from the borrower, so the
+        borrower holds the receipt token before the batch. Returns the share balance the
+        wrap produced.
+        """
+        before = self._c(share_token, _EVAULT_VIEW).functions.balanceOf(borrower).call()
+        self.fork.deal(underlying, borrower, underlying_amount)
+        self._approve(borrower, underlying, share_token)
+        self._deposit(borrower, share_token, underlying_amount, borrower)
+        after = self._c(share_token, _EVAULT_VIEW).functions.balanceOf(borrower).call()
+        return after - before
+
     def _cv_from_receipt(self, rcpt) -> str:
         topic0 = Web3.keccak(text="T_CollateralVaultCreated(address)")
         for log in rcpt["logs"]:
@@ -238,21 +251,21 @@ class StateSeeder:
     def create_euler_cv(self, borrower, liq_ltv, collateral_underlying, borrow_amount) -> CVHandles:
         self._top_up_iv(IV_EULER_EWETH, EULER_WETH, WETH, "twyneCLP")
         data = encode_call(
-            "createCollateralVault(uint8,address,address,uint256,address)",
-            ["uint8", "address", "address", "uint256", "address"],
-            [VAULT_TYPE_EULER, IV_EULER_EWETH, EULER_USDC, liq_ltv, ZERO],
+            "createEulerCollateralVault(address,address,uint256)",
+            ["address", "address", "uint256"],
+            [IV_EULER_EWETH, EULER_USDC, liq_ltv],
         )
         rcpt = self.fork.send(borrower, FACTORY, data)
         cv = self._cv_from_receipt(rcpt)
 
-        self.fork.deal(WETH, borrower, collateral_underlying)
-        self._approve(borrower, WETH, cv)
+        collateral_shares = self._wrap_for_borrower(borrower, EULER_WETH, WETH, collateral_underlying)
+        self._approve(borrower, EULER_WETH, cv)
         items = [
             (
                 cv,
                 borrower,
                 0,
-                bytes.fromhex(encode_call("depositUnderlying(uint256)", ["uint256"], [collateral_underlying])[2:]),
+                bytes.fromhex(encode_call("deposit(uint256)", ["uint256"], [collateral_shares])[2:]),
             ),
             (
                 cv,
@@ -407,21 +420,21 @@ class StateSeeder:
     def create_aave_cv(self, borrower, liq_ltv, collateral_underlying, borrow_amount) -> CVHandles:
         self._top_up_iv(IV_AAVE_AWSTETH, AWSTETH_WRAPPER, WSTETH, "twyneAaveCLP")
         data = encode_call(
-            "createCollateralVault(uint8,address,address,uint256,address)",
-            ["uint8", "address", "address", "uint256", "address"],
-            [VAULT_TYPE_AAVE, IV_AAVE_AWSTETH, AAVE_POOL, liq_ltv, WETH],
+            "createAaveV3CollateralVault(address,address,uint256,address)",
+            ["address", "address", "uint256", "address"],
+            [IV_AAVE_AWSTETH, AAVE_POOL, liq_ltv, WETH],
         )
         rcpt = self.fork.send(borrower, FACTORY, data)
         cv = self._cv_from_receipt(rcpt)
 
-        self.fork.deal(WSTETH, borrower, collateral_underlying)
-        self._approve(borrower, WSTETH, cv)
+        collateral_shares = self._wrap_for_borrower(borrower, AWSTETH_WRAPPER, WSTETH, collateral_underlying)
+        self._approve(borrower, AWSTETH_WRAPPER, cv)
         items = [
             (
                 cv,
                 borrower,
                 0,
-                bytes.fromhex(encode_call("depositUnderlying(uint256)", ["uint256"], [collateral_underlying])[2:]),
+                bytes.fromhex(encode_call("deposit(uint256)", ["uint256"], [collateral_shares])[2:]),
             ),
             (
                 cv,
