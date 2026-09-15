@@ -18,10 +18,10 @@ from app.liquidation.config_loader import load_chain_config
 from .anvil import AnvilFork
 from .deploy import deploy_fork_contracts
 from .state_seeder import StateSeeder
-from .upgrade_107 import apply_upgrade, is_upgraded, should_apply
 
-# Twyne 1.0.7 is not on mainnet yet, so the harness forks the LATEST block and applies
-# the upgrade itself (see upgrade_107.py). Set E2E_FORK_BLOCK to pin a block instead.
+# Use the deployed contracts on a post-upgrade mainnet fork.
+# This baseline passed the full end-to-end suite with Twyne 1.0.7.
+_MIN_FORK_BLOCK = 25_982_234
 _DEFAULT_RPC = "https://eth.drpc.org"
 
 
@@ -32,7 +32,10 @@ def _fork_url() -> str:
 def _fork_block(url: str) -> int:
     pinned = os.environ.get("E2E_FORK_BLOCK")
     if pinned:
-        return int(pinned)
+        block = int(pinned)
+        if block < _MIN_FORK_BLOCK:
+            raise ValueError(f"E2E_FORK_BLOCK must be at least {_MIN_FORK_BLOCK} for the supported contract fixtures")
+        return block
     # Fork one block behind the head: anvil serves the base block from the upstream
     # archive, and the very tip can still be re-organised while the suite runs.
     return Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 60})).eth.block_number - 1
@@ -51,12 +54,6 @@ def fork():
     f = AnvilFork(url, block).start()
     f.fork_base_block = block
     f.set_balance(LIQUIDATOR_EOA, 10**21)  # 1000 ETH for gas
-    if should_apply():
-        apply_upgrade(f)
-    assert is_upgraded(f), (
-        "the fork does not run Twyne 1.0.7. Set E2E_APPLY_TWYNE_107=1 to apply Safe nonce 29 "
-        "on the fork, or fork a block after the upgrade goes live."
-    )
     yield f
     f.stop()
 
