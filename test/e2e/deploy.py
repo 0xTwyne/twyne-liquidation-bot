@@ -1,4 +1,4 @@
-"""Deploy the e2e fork contracts (DEV-579 Part 2).
+"""Deploy the e2e fork contracts (DEV-579 Part 2, extended by DEV-661).
 
 The production liquidators route swaps to the 1inch router (fixed at deploy time),
 so an e2e fork run deploys FRESH liquidators whose ``router`` is the Solidity
@@ -31,6 +31,7 @@ class ForkContracts:
     mock_swapper: str
     euler_liquidator: str
     aave_liquidator: str
+    health_stat_viewer: str
 
 
 def _creation_hex(name: str, arg_types: list, args: list) -> str:
@@ -44,6 +45,9 @@ def _creation_hex(name: str, arg_types: list, args: list) -> str:
 
 def deploy_fork_contracts(fork: AnvilFork, owner: str, fund: int = 5_000 * 10**18) -> ForkContracts:
     """Deploy MockSwapper + fork liquidators (router=MockSwapper) and fund the swapper.
+
+    Also deploys the HealthStatViewer of this repository, because the address in
+    app/config.yaml points at the lens of the previous contract version.
 
     ``owner`` is the liquidator owner (use the bot's LIQUIDATOR_EOA). ``fund`` is the
     amount of each target asset (USDC scaled to 6dp, WETH 18dp) dealt to the swapper.
@@ -66,8 +70,21 @@ def deploy_fork_contracts(fork: AnvilFork, owner: str, fund: int = 5_000 * 10**1
         ),
     )
 
+    # The lens in app/config.yaml is the one deployed for the previous contract
+    # version, so deploy the lens of this repository against the fork and point the bot
+    # at it through HEALTHSTATVIEWER_OVERRIDE (DEV-660 / DEV-661).
+    health_stat_viewer = fork.deploy(
+        _DEPLOYER,
+        _creation_hex("HealthStatViewer", ["address"], [Web3.to_checksum_address(AAVE_POOL)]),
+    )
+
     # Pre-fund the mock swapper so it can deliver the target asset on either path.
     fork.deal(USDC, mock, 5_000_000 * 10**6)  # USDC (6dp) for the Euler path
     fork.deal(WETH, mock, fund)  # WETH (18dp) for the Aave path
 
-    return ForkContracts(mock_swapper=mock, euler_liquidator=euler_liq, aave_liquidator=aave_liq)
+    return ForkContracts(
+        mock_swapper=mock,
+        euler_liquidator=euler_liq,
+        aave_liquidator=aave_liq,
+        health_stat_viewer=health_stat_viewer,
+    )

@@ -78,7 +78,7 @@ def _vault(amount_in_underlying: int = 1_100, oracle=None):
         address=COLLATERAL_VAULT,
         underlying_asset_address=UNDERLYING_ASSET,
         target_asset=TARGET_ASSET,
-        # maxTwyneLTVs is keyed by the intermediate vault (DEV-579 external-path fix).
+        # The liquidation parameters are keyed by (intermediate vault, target asset).
         intermediate_vault_address="0x75029a47f28550C93Ad5A3BbD2d9b5315204B561",
         oracle_router=oracle if oracle is not None else _oracle(),
         unit_of_account=UNIT_OF_ACCOUNT,
@@ -243,7 +243,7 @@ def test_aave_external_returns_usd_net_profit(monkeypatch):
     vault.asset.functions.decimals.return_value.call.return_value = 0
     vault.asset.functions.convertToAssets.return_value.call.return_value = 1_500
     vault.vault_manager = MagicMock()
-    vault.vault_manager.functions.maxTwyneLTVs.return_value.call.return_value = 5_000
+    vault.get_max_twyne_ltv = MagicMock(return_value=5_000)
     vault.aave_pool = MagicMock()
     vault.aave_pool.functions.getUserAccountData.return_value.call.return_value = (0, 1_000, 0, 0, 0, 0)
     vault.instance.functions.collateralForBorrower.return_value.call.return_value = 500
@@ -272,7 +272,7 @@ def test_aave_external_under_repay_skips(monkeypatch):
     vault.asset.functions.decimals.return_value.call.return_value = 0
     vault.asset.functions.convertToAssets.return_value.call.return_value = 1_500
     vault.vault_manager = MagicMock()
-    vault.vault_manager.functions.maxTwyneLTVs.return_value.call.return_value = 5_000
+    vault.get_max_twyne_ltv = MagicMock(return_value=5_000)
     vault.aave_pool = MagicMock()
     vault.aave_pool.functions.getUserAccountData.return_value.call.return_value = (0, 1_000, 0, 0, 0, 0)
     vault.instance.functions.collateralForBorrower.return_value.call.return_value = 500
@@ -325,7 +325,7 @@ def _ext_vault(monkeypatch, *, min_return: int, gas_estimate: int = 10, min_net_
     vault.asset.functions.decimals.return_value.call.return_value = 0
     vault.asset.functions.convertToAssets.return_value.call.return_value = 1_500
     vault.vault_manager = MagicMock()
-    vault.vault_manager.functions.maxTwyneLTVs.return_value.call.return_value = 5_000
+    vault.get_max_twyne_ltv = MagicMock(return_value=5_000)
     vault.aave_pool = MagicMock()
     vault.aave_pool.functions.getUserAccountData.return_value.call.return_value = (0, 1_000, 0, 0, 0, 0)
     vault.instance.functions.collateralForBorrower.return_value.call.return_value = 500

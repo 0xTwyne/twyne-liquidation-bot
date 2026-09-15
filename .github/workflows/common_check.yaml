@@ -33,7 +33,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        # v1.9.0 switched to the standalone Rust rewrite of foundryup. Pins at
+        # or below v1.8.0 invoke the installer with `bash`, which now fails —
+        # `foundryup: cannot execute binary file` — because the artifact it
+        # downloads is an ELF binary, not a shell script. Do not pin back.
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           version: v1.7.1
       - name: Run Forge build

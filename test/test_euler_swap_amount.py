@@ -143,7 +143,7 @@ class TestExternallyLiquidatedZeroRepay:
             total_assets=10_000,
         )
 
-        vault.vault_manager.functions.maxTwyneLTVs.assert_not_called()
+        vault.get_max_twyne_ltv.assert_not_called()
         vault.oracle_router.functions.getQuote.assert_not_called()
         vault.asset.functions.balanceOf.assert_not_called()
         vault.asset.functions.convertToShares.assert_not_called()
@@ -165,7 +165,7 @@ class TestExternallyLiquidatedWithRepay:
         max_release = 100_000
         MAXFACTOR = 10_000
 
-        max_ltv = 8_000  # vault_manager.maxTwyneLTVs
+        max_ltv = 8_000  # vault.get_max_twyne_ltv() -> liqParams(iv, targetAsset)[1]
 
         # user_collateral_underlying = oracle.getQuote(max_repay * MAXFACTOR // max_ltv, ...)
         # = oracle.getQuote(800_000 * 10_000 // 8_000, ...) = oracle.getQuote(1_000_000, ...)
@@ -184,8 +184,8 @@ class TestExternallyLiquidatedWithRepay:
         # liquidator_reward_shares = c_new - borrower_claim = 1_900_000 - 1_600_000 = 300_000
         final_amount = 280_000  # asset.convertToAssets(liquidator_reward_shares)
 
-        # Wire vault_manager
-        vault.vault_manager.functions.maxTwyneLTVs.return_value.call.return_value = max_ltv
+        # Wire the VaultManager read (liqParams(intermediateVault, targetAsset)[1])
+        vault.get_max_twyne_ltv.return_value = max_ltv
 
         # Wire oracle_router for BOTH getQuote calls via side_effect
         first_getquote = MagicMock()
@@ -236,9 +236,10 @@ class TestExternallyLiquidatedWithRepay:
 
         assert result == params["final_amount"]
 
-    def test_maxTwyneLTVs_called_with_intermediate_vault(self):
-        # DEV-579: maxTwyneLTVs is keyed by the intermediate vault, not the collateral
-        # asset/eToken (keying on asset_address returns 0 and divides-by-zero).
+    def test_max_twyne_ltv_read_once_from_the_vault_helper(self):
+        # DEV-579 / DEV-661: the max Twyne LTV comes from the shared helper, which reads
+        # VaultManager.liqParams(intermediateVault, targetAsset). Keying that read on the
+        # collateral asset returns 0 and divides-by-zero in the math below.
         vault, params = self._setup_vault()
 
         _calculate_swap_amount(
@@ -250,7 +251,7 @@ class TestExternallyLiquidatedWithRepay:
             total_assets=0,
         )
 
-        vault.vault_manager.functions.maxTwyneLTVs.assert_called_once_with(vault.intermediate_vault_address)
+        vault.get_max_twyne_ltv.assert_called_once_with()
 
     def test_first_getQuote_uses_scaled_repay(self):
         """First oracle call: getQuote(max_repay * MAXFACTOR // max_ltv, target_asset, underlying_asset)."""
@@ -375,5 +376,5 @@ class TestNeitherBranch:
         )
 
         vault.asset.functions.convertToAssets.assert_not_called()
-        vault.vault_manager.functions.maxTwyneLTVs.assert_not_called()
+        vault.get_max_twyne_ltv.assert_not_called()
         vault.oracle_router.functions.getQuote.assert_not_called()

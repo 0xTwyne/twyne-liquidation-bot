@@ -3,8 +3,8 @@
 Tier A drives the genuine pipeline — FactoryListener discovery ->
 AccountMonitor._process_account_update -> simulate -> BaseLiquidator.execute_liquidation
 -> sign -> send -> mine — for each seeded variant, asserting the position is closed.
-The seeded CV lives in anvil blocks ABOVE the fork block, so scanning [FORK_BLOCK+1,
-head] discovers exactly it via the real listener code.
+The seeded CV lives in anvil blocks ABOVE the fork base block, so scanning
+[base+1, head] discovers exactly it via the real listener code.
 
 Tier B (test_full_flask_app_liquidates) boots the real Flask app once and lets it
 autonomously discover + liquidate a seeded CV, covering the threadpool + bootstrap.
@@ -19,7 +19,6 @@ from web3 import Web3
 from app.liquidation.account_monitor import AccountMonitor
 from app.liquidation.event_listener import FactoryListener
 
-from .conftest import FORK_BLOCK
 from .state_seeder import _addr
 
 EULER_LIQ_LTV = 9400
@@ -37,8 +36,10 @@ def _run_bot(cfg, cv: str) -> AccountMonitor:
     revert (the bot's own failure counter stays 0)."""
     monitor = AccountMonitor(chain_id=1, config=cfg, notify=False, execute_liquidation=True)
     listener = FactoryListener(monitor, cfg)
-    monitor.latest_block = FORK_BLOCK
-    listener.scan_block_ranges(FORK_BLOCK + 1, cfg.w3.eth.block_number)
+    # bot_config sets the deployment-block override to the fork base block + 1.
+    base_block = cfg.CVAULT_FACTORY_DEPLOYMENT_BLOCK - 1
+    monitor.latest_block = base_block
+    listener.scan_block_ranges(base_block + 1, cfg.w3.eth.block_number)
     cv = Web3.to_checksum_address(cv)
     assert cv in monitor.accounts, "listener did not discover the seeded CV"
     monitor._process_account_update(cv)

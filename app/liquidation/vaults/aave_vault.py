@@ -4,9 +4,12 @@ Aave V3 protocol collateral vault and liquidator.
 
 from typing import Any, Dict, Optional, Tuple
 
+from web3 import Web3
+
 from app.liquidation.config_loader import ChainConfig
 from app.liquidation.constants import GAS_ESTIMATE_BUFFER, LTV_MAXFACTOR, SWAP_MARGIN_DIVISOR
 from app.liquidation.contracts import create_contract_instance
+from app.liquidation.errors import describe_revert
 from app.liquidation.gas import GasFees, get_eip1559_fees
 from app.liquidation.logging_config import setup_logger
 from app.liquidation.profitability import (
@@ -73,7 +76,13 @@ class AaveCollateralVault(BaseCollateralVault):
         # unit, exactly as the Euler path does. Also lets notifications value Aave gas
         # in USD (notifications._gas_cost reads account.oracle_router/unit_of_account).
         self.unit_of_account = self.intermediate_vault.functions.unitOfAccount().call()
-        self.oracle_router_address = self.vault_manager.functions.oracleRouter().call()
+        # An Aave collateral vault values its collateral with the wrapper's latestAnswer()
+        # and uses a router only to price the target asset and WETH in USD for the profit
+        # gate. Twyne 1.0.7 removed VaultManager.oracleRouter(), and the router of the Aave
+        # intermediate vault prices the aToken wrapper but not the raw tokens, so prefer the
+        # chain's Euler oracle router from config.yaml and fall back to the intermediate
+        # vault's oracle when the chain does not configure one.
+        self.oracle_router_address = self._pricing_router_address(config)
         self.oracle_router = create_contract_instance(self.oracle_router_address, config.EULER_ROUTER_ABI_PATH, config)
 
         self.liqbot_instance = create_contract_instance(
@@ -82,6 +91,16 @@ class AaveCollateralVault(BaseCollateralVault):
 
         # Cache immutable token decimals/symbol once (finding P6).
         self._cache_token_metadata()
+
+    def _pricing_router_address(self, config: ChainConfig) -> str:
+        """Address of the router that prices the raw target asset and WETH in USD."""
+        try:
+            configured = config.ORACLE_ROUTER_ADDRESS
+        except AttributeError:
+            configured = None
+        if configured:
+            return Web3.to_checksum_address(configured)
+        return self.intermediate_vault.functions.oracle().call()
 
     def _init_protocol_contracts_from_metadata(self, config: ChainConfig, meta: dict) -> None:
         """Reconstruct contract instances from persisted immutable metadata (P3, no RPC)."""
@@ -178,7 +197,13 @@ class AaveLiquidator(BaseLiquidator):
                 )
             return (False, None, None)
         except Exception as ex:
-            logger.error("AaveLiquidator: simulate_liquidation failed for %s: %s", vault.address, ex, exc_info=True)
+            logger.error(
+                "AaveLiquidator: simulate_liquidation failed for %s: %s%s",
+                vault.address,
+                ex,
+                describe_revert(ex),
+                exc_info=True,
+            )
             return (False, None, None)
 
     @staticmethod
@@ -381,11 +406,10 @@ class AaveLiquidator(BaseLiquidator):
             return ({"profit": 0}, liquidation_tx)
 
         collateral_balance = collateral_vault.asset.functions.balanceOf(collateral_vault.address).call()
-        # maxTwyneLTVs is keyed by the intermediate vault (not the collateral wrapper);
-        # keying on asset_address returns 0 and divides-by-zero (DEV-579 external-path fix).
-        max_ltv = collateral_vault.vault_manager.functions.maxTwyneLTVs(
-            collateral_vault.intermediate_vault_address
-        ).call()
+        # The liquidation parameters are keyed by (intermediate vault, target asset) since
+        # Twyne 1.0.7. Keying on the collateral wrapper returns 0 and divides-by-zero
+        # (DEV-579 external-path fix).
+        max_ltv = collateral_vault.get_max_twyne_ltv()
 
         latest_answer = collateral_vault.asset.functions.latestAnswer().call()
         decimals = collateral_vault.asset.functions.decimals().call()

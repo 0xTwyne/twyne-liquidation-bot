@@ -63,7 +63,7 @@ def test_calculate_external_profit_returns_reward_minus_debt():
     vault.underlying_asset_address = UNDERLYING_ASSET
     vault.unit_of_account = UNIT
 
-    vault.vault_manager.functions.maxTwyneLTVs.return_value.call.return_value = 8000
+    vault.get_max_twyne_ltv.return_value = 8000
     # getQuote is called three times in order: user_collateral_underlying,
     # c_new_usd, liquidator_reward_usd.
     vault.oracle_router.functions.getQuote.side_effect = [
@@ -90,7 +90,7 @@ def test_calculate_external_profit_can_be_negative():
     vault.underlying_asset_address = UNDERLYING_ASSET
     vault.unit_of_account = UNIT
 
-    vault.vault_manager.functions.maxTwyneLTVs.return_value.call.return_value = 8000
+    vault.get_max_twyne_ltv.return_value = 8000
     vault.oracle_router.functions.getQuote.side_effect = [
         _quote(500),
         _quote(7000),

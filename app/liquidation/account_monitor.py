@@ -306,6 +306,7 @@ class AccountMonitor:
                 account.internal_health_score_raw < HF_ONE
                 or account.external_health_score_raw < HF_ONE
                 or externally_liquidated
+                or account.health_unknown
             ):
                 # Gate the (5-eth_call) on-chain liquidation check on the cheap
                 # snapshot already in hand. For a healthy, non-externally-liquidated
@@ -316,6 +317,13 @@ class AccountMonitor:
                 # steady-state tick to <=2 eth_calls (health + isExternallyLiquidated).
                 # See DEV-554. Once the gate opens, the authoritative on-chain
                 # check_liquidation result drives the decision exactly as before.
+                #
+                # `health_unknown` also opens the gate (DEV-661). When the health read
+                # fails repeatedly the health factors hold a fallback value that reads
+                # as healthy, so without this the bot would silently stop liquidating.
+                # The on-chain canLiquidate() does not use the lens, so it still gives
+                # the right answer. This costs the full 5-eth_call check per tick for
+                # every affected vault, which is the intended trade for not going blind.
                 #
                 # Compare the RAW 1e18-scaled HF integers (set by get_health_score during
                 # the update_liquidity() call above), NOT the /1e18 floats: float64

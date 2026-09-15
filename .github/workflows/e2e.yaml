@@ -29,7 +29,9 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Install Foundry (forge + anvil)
-        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        # Keep in lockstep with common_check.yaml — see the note there on why
+        # v1.9.1 is the floor.
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           version: v1.7.1
       - name: Forge build (e2e needs out/ artifacts)

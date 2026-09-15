@@ -10,6 +10,7 @@ from web3.exceptions import BlockNotFound, ContractLogicError
 from app.liquidation.config_loader import ChainConfig
 from app.liquidation.constants import GAS_ESTIMATE_BUFFER, LTV_MAXFACTOR, SWAP_MARGIN_DIVISOR
 from app.liquidation.contracts import create_contract_instance
+from app.liquidation.errors import describe_revert
 from app.liquidation.exceptions import TransactionBuildError
 from app.liquidation.gas import get_eip1559_fees
 from app.liquidation.logging_config import setup_logger
@@ -66,11 +67,10 @@ class EulerCollateralVault(BaseCollateralVault):
 
         self.vault_manager_address = self.instance.functions.twyneVaultManager().call()
         self.vault_manager = create_contract_instance(self.vault_manager_address, config.VAULT_MANAGER_ABI_PATH, config)
-        self.oracle_router_address = self.vault_manager.functions.oracleRouter().call()
+        # Twyne 1.0.7: the collateral vault prices its collateral with the intermediate
+        # vault's router, and VaultManager.oracleRouter() no longer exists.
+        self.oracle_router_address = self.intermediate_vault.functions.oracle().call()
         self.oracle_router = create_contract_instance(self.oracle_router_address, config.EULER_ROUTER_ABI_PATH, config)
-
-        self.vault_name = self.instance.functions.name().call()
-        self.vault_symbol = self.instance.functions.symbol().call()
 
         self.liqbot_instance = config.euler_liqbot
 
@@ -104,9 +104,6 @@ class EulerCollateralVault(BaseCollateralVault):
         self.oracle_router_address = meta["oracle_router_address"]
         self.oracle_router = create_contract_instance(self.oracle_router_address, config.EULER_ROUTER_ABI_PATH, config)
 
-        self.vault_name = meta.get("vault_name", "")
-        self.vault_symbol = meta.get("vault_symbol", "")
-
         self.liqbot_instance = config.euler_liqbot
 
         self._restore_token_metadata(meta)
@@ -121,9 +118,10 @@ class EulerCollateralVault(BaseCollateralVault):
             "intermediate_vault_address": self.intermediate_vault_address,
             "unit_of_account": self.unit_of_account,
             "vault_manager_address": self.vault_manager_address,
+            # The intermediate vault's oracle() as read at discovery. Twyne 1.0.7
+            # removed the collateral vault's name() and symbol(), which this metadata
+            # used to carry; nothing in the bot read them.
             "oracle_router_address": self.oracle_router_address,
-            "vault_name": self.vault_name,
-            "vault_symbol": self.vault_symbol,
         }
 
     def get_collateral_for_borrower(self) -> int:
@@ -185,10 +183,19 @@ class EulerLiquidator(BaseLiquidator):
             return (False, None, None)
 
         except (ValueError, ContractLogicError, BlockNotFound) as ex:
-            logger.error("Liquidator: Liquidation simulation failed for %s: %s", vault.address, ex, exc_info=True)
+            logger.error(
+                "Liquidator: Liquidation simulation failed for %s: %s%s",
+                vault.address,
+                ex,
+                describe_revert(ex),
+                exc_info=True,
+            )
             return (False, None, None)
         except Exception as ex:
-            message = f"LiqSim: Unexpected exception for {vault.address} with collateral {collateral_asset}: {ex}"
+            message = (
+                f"LiqSim: Unexpected exception for {vault.address} with collateral "
+                f"{collateral_asset}: {ex}{describe_revert(ex)}"
+            )
             logger.error("Liquidator: %s", message, exc_info=True)
 
             time_of_last_post = liquidation_error_slack_cooldown.get(vault.address, 0)
@@ -309,10 +316,11 @@ class EulerLiquidator(BaseLiquidator):
 
 def _calculate_external_profit(vault: EulerCollateralVault, max_repay: int, max_release: int, debt_value: int) -> int:
     """Calculate profit for an externally liquidated vault."""
-    # maxTwyneLTVs is keyed by the intermediate vault (not the collateral asset/eToken):
-    # keying on asset_address returns 0 and divides-by-zero in the external-profit math
-    # below — a latent bug in the external path surfaced by the DEV-579 fork e2e.
-    max_ltv = vault.vault_manager.functions.maxTwyneLTVs(vault.intermediate_vault_address).call()
+    # The liquidation parameters are keyed by (intermediate vault, target asset) since
+    # Twyne 1.0.7. Keying on asset_address returns 0 and divides-by-zero in the
+    # external-profit math below — a latent bug in the external path surfaced by the
+    # DEV-579 fork e2e.
+    max_ltv = vault.get_max_twyne_ltv()
     user_collateral_underlying = vault.oracle_router.functions.getQuote(
         int(max_repay * LTV_MAXFACTOR // max_ltv), vault.target_asset, vault.underlying_asset_address
     ).call()
@@ -513,9 +521,9 @@ def _calculate_swap_amount(
             logger.info("External liquidation with zero maxRepay - no swap needed")
             return 0
 
-        # maxTwyneLTVs is keyed by the intermediate vault (not the collateral asset/eToken);
+        # The liquidation parameters are keyed by (intermediate vault, target asset);
         # see _calculate_external_profit for the DEV-579 keying-bug note.
-        max_ltv = vault.vault_manager.functions.maxTwyneLTVs(vault.intermediate_vault_address).call()
+        max_ltv = vault.get_max_twyne_ltv()
         user_collateral_underlying = vault.oracle_router.functions.getQuote(
             int(max_repay * LTV_MAXFACTOR // max_ltv), vault.target_asset, vault.underlying_asset_address
         ).call()

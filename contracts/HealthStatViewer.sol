@@ -11,6 +11,8 @@ interface IEVault {
     function asset() external view returns (address);
     function unitOfAccount() external view returns (address);
     function debtOf(address account) external view returns (uint256);
+    /// @dev Twyne 1.0.7: collateral vaults price collateral with the intermediate vault's router.
+    function oracle() external view returns (address);
 }
 
 interface IERC20 {
@@ -36,6 +38,11 @@ interface IAaveV3Pool {
     function getReserveData(address asset) external view returns (ReserveData memory);
     function getEModeCategoryCollateralBitmap(uint8 id) external view returns (uint128);
     function getEModeCategoryCollateralConfig(uint8 id) external view returns (CollateralConfig memory);
+    function ADDRESSES_PROVIDER() external view returns (IAaveV3AddressesProvider);
+}
+
+interface IAaveV3AddressesProvider {
+    function getPoolDataProvider() external view returns (address);
 }
 
 /// @dev MUST mirror the live Aave V3 mainnet Pool's `getReserveData` return type
@@ -104,7 +111,7 @@ struct PositionStats {
     uint32 externalLTV; // LTV_e = B/(C+C_LP) bps — unbounded ratio
     uint256 extHF; // 1e18
     uint256 inHF; // 1e18
-    uint16 maxTwyneLTV; // ~LTV_t^max bps — the protocol cap maxTwyneLTVs(iv); twyneLiqLTV = min(chosen, this)
+    uint16 maxTwyneLTV; // ~LTV_t^max bps — the protocol cap liqParams(iv, targetAsset).maxTwyneLiqLTV; twyneLiqLTV = min(chosen, this)
 }
 
 interface IAaveV3DataProvider {
@@ -137,27 +144,31 @@ interface ICollateralVaultBase {
     function totalAssetsDepositedOrReserved() external view returns (uint256);
     function maxRelease() external view returns (uint256);
     function twyneLiqLTV() external view returns (uint256);
+    /// @dev Borrowed asset. Euler vaults: immutable, equals IEVault(targetVault).asset().
+    /// Aave vaults: the asset the debt is denominated in, distinct from underlyingAsset().
+    /// Together with intermediateVault() it is the key of the VaultManager 1.0.7
+    /// liquidation parameters (liqParams).
+    function targetAsset() external view returns (address);
 }
 
 interface IAaveV3CollateralVault is ICollateralVaultBase {
-    function tenPowAssetDecimals() external view returns (uint256);
     function categoryId() external view returns (uint8);
     function underlyingAsset() external view returns (address);
     function aToken() external view returns (address);
-    function aaveDataProvider() external view returns (IAaveV3DataProvider);
-    // Borrowed asset (the asset debt is denominated in), distinct from the collateral
-    // underlyingAsset(). The Python bot reads the same getter (aave_vault.py: targetAsset()).
-    function targetAsset() external view returns (address);
 }
 
 interface IAaveV3ATokenWrapper {
     function latestAnswer() external view returns (int256);
+    function decimals() external view returns (uint8);
 }
 
+/// @dev Twyne VaultManager 1.0.7 (V5). Liquidation parameters are keyed by
+/// (intermediateVault, targetAsset). The one-argument getters of V4 are gone.
 interface IVaultManager {
-    function externalLiqBuffers(address intermediateVault) external view returns (uint16);
-    function maxTwyneLTVs(address intermediateVault) external view returns (uint16);
-    function oracleRouter() external view returns (IEulerRouter);
+    function liqParams(address intermediateVault, address targetAsset)
+        external
+        view
+        returns (uint16 externalLiqBuffer, uint16 maxTwyneLiqLTV, uint16 borrowBuffer);
 }
 
 library EModeConfiguration {
@@ -179,12 +190,36 @@ library Math {
 /// @title HealthStatViewer
 /// @notice To contact the team regarding security matters, visit https://twyne.xyz/security
 /// @dev functions to view liquidation health related stats of collateral vaults. Useful for frontend.
+/// Targets Twyne contracts 1.0.7 (VaultManager V5, CollateralVaultFactory V5, Euler CV V4, Aave CV V3):
+/// liquidation parameters come from VaultManager.liqParams(intermediateVault, targetAsset), the price
+/// router from the intermediate vault's oracle(). It does not work against the 1.0.6 contracts.
 contract HealthStatViewer {
     uint256 internal constant MAXFACTOR = 1e4;
     address public immutable aavePool;
 
     constructor(address _aavePool) {
         aavePool = _aavePool;
+    }
+
+    /// @dev Read the (externalLiqBuffer, maxTwyneLiqLTV) pair of a collateral vault from
+    /// VaultManager.liqParams(intermediateVault, targetAsset). Mirrors CollateralVaultBase._liqParams()
+    /// outside of a batch (snapshot == 0).
+    function _liqParams(ICollateralVaultBase cv) internal view returns (uint256 buffer, uint256 maxTwyneLiqLTV) {
+        (uint16 _buffer, uint16 _maxTwyneLiqLTV,) =
+            cv.twyneVaultManager().liqParams(address(cv.intermediateVault()), cv.targetAsset());
+        return (uint256(_buffer), uint256(_maxTwyneLiqLTV));
+    }
+
+    /// @dev The EulerRouter a collateral vault prices its collateral with: the intermediate
+    /// vault's oracle. Mirrors EulerCollateralVault 1.0.7 (`EulerRouter(intermediateVault.oracle())`).
+    function _router(IEVault intermediateVault) internal view returns (IEulerRouter) {
+        return IEulerRouter(intermediateVault.oracle());
+    }
+
+    /// @dev 10 ** decimals of the collateral wrapper (AaveV3ATokenWrapper). Mirrors the
+    /// AaveV3CollateralVault immutable `tenPowAssetDecimals`, which has no getter in 1.0.7.
+    function _tenPowAssetDecimals(ICollateralVaultBase cv) internal view returns (uint256) {
+        return 10 ** uint256(IAaveV3ATokenWrapper(cv.asset()).decimals());
     }
 
     /// @notice Check health factor from from Intermediate vault's perspective.
@@ -288,7 +323,7 @@ contract HealthStatViewer {
 
         (s.extHF, s.inHF, s.borrowUsd,) = this.health(collateralVault);
 
-        uint256 maxTwyne = uint256(cv.twyneVaultManager().maxTwyneLTVs(address(cv.intermediateVault())));
+        (, uint256 maxTwyne) = _liqParams(cv);
         s.twyneLiqLTV = uint16(Math.min(cv.twyneLiqLTV(), maxTwyne));
         s.maxTwyneLTV = uint16(maxTwyne);
 
@@ -313,7 +348,7 @@ contract HealthStatViewer {
         IEVault intermediateVault = cv.intermediateVault();
         address asset = cv.asset();
         address uoa = intermediateVault.unitOfAccount();
-        IEulerRouter router = cv.twyneVaultManager().oracleRouter();
+        IEulerRouter router = _router(intermediateVault);
 
         s.userCollateralUsd = router.getQuote(s.userCollateralNative, asset, uoa);
         s.reservedCreditUsd = router.getQuote(s.reservedCreditNative, asset, uoa);
@@ -330,7 +365,7 @@ contract HealthStatViewer {
         view
     {
         uint256 price = uint256(IAaveV3ATokenWrapper(cv.asset()).latestAnswer());
-        uint256 tenPow = IAaveV3CollateralVault(collateralVault).tenPowAssetDecimals();
+        uint256 tenPow = _tenPowAssetDecimals(cv);
 
         // n * price / tenPow is Aave-base (1e8); multiply by 1e10 to reach the 1e18 USD scale.
         s.userCollateralUsd = s.userCollateralNative * price * 1e10 / tenPow;
@@ -341,7 +376,7 @@ contract HealthStatViewer {
         // borrowNative mirrors the Euler branch's targetVault.debtOf(cv) semantics.
         // (Using underlyingAsset() here returns 0 whenever the borrowed asset differs from
         // the collateral, which is the normal Twyne Aave case.)
-        address borrowedAsset = IAaveV3CollateralVault(collateralVault).targetAsset();
+        address borrowedAsset = cv.targetAsset();
         ReserveData memory rd = IAaveV3Pool(aavePool).getReserveData(borrowedAsset);
         s.borrowNative = IERC20(rd.variableDebtTokenAddress).balanceOf(collateralVault);
 
@@ -354,7 +389,7 @@ contract HealthStatViewer {
         returns (uint256 extHF, uint256 inHF, uint256 externalBorrowDebtValue)
     {
         ICollateralVaultBase cv = ICollateralVaultBase(collateralVault);
-        uint256 buffer = uint256(cv.twyneVaultManager().externalLiqBuffers(address(cv.intermediateVault())));
+        (uint256 buffer, uint256 maxTwyneLiqLTV) = _liqParams(cv);
         (, uint256 liabilityValue,,,, uint256 healthFactor) = IAaveV3Pool(aavePool).getUserAccountData(collateralVault);
 
         // extHF tracks liquidation condition 1, where the external protocol's liquidation limit is nearly hit
@@ -365,9 +400,9 @@ contract HealthStatViewer {
 
         // inHF tracks liquidation condition 2 using AaveV3CollateralVault._canLiquidate() math
         uint256 adjExtLiqLTV = buffer * _aaveExtLiqLTV(collateralVault);
-        uint256 collateralValueScaledByLiqLTV = _collateralScaledByLiqLTV1e8(collateralVault, adjExtLiqLTV)
+        uint256 collateralValueScaledByLiqLTV = _collateralScaledByLiqLTV1e8(cv, adjExtLiqLTV, maxTwyneLiqLTV)
             * uint256(IAaveV3ATokenWrapper(cv.asset()).latestAnswer())
-            / IAaveV3CollateralVault(collateralVault).tenPowAssetDecimals();
+            / _tenPowAssetDecimals(cv);
         inHF = collateralValueScaledByLiqLTV * 1e18 / (liabilityValue * MAXFACTOR * MAXFACTOR);
     }
 
@@ -379,7 +414,7 @@ contract HealthStatViewer {
         ICollateralVaultBase cv = ICollateralVaultBase(collateralVault);
         IEVault targetVault = IEVault(cv.targetVault());
         IEVault intermediateVault = cv.intermediateVault();
-        uint256 buffer = uint256(cv.twyneVaultManager().externalLiqBuffers(address(intermediateVault)));
+        (uint256 buffer, uint256 maxTwyneLiqLTV) = _liqParams(cv);
         uint256 externalCollateralValueScaledByLiqLTV;
         (externalCollateralValueScaledByLiqLTV, externalBorrowDebtValue) =
             targetVault.accountLiquidity(collateralVault, true);
@@ -390,29 +425,25 @@ contract HealthStatViewer {
 
         // inHF tracks liquidation condition 2 using EulerCollateralVault._canLiquidate() math
         uint256 adjExtLiqLTV = buffer * uint256(targetVault.LTVLiquidation(cv.asset()));
-        uint256 collateralValueScaledByLiqLTV = cv.twyneVaultManager().oracleRouter()
-            .getQuote(
-                _collateralScaledByLiqLTV1e8(collateralVault, adjExtLiqLTV),
-                cv.asset(),
-                intermediateVault.unitOfAccount()
-            );
+        uint256 collateralValueScaledByLiqLTV = _router(intermediateVault).getQuote(
+            _collateralScaledByLiqLTV1e8(cv, adjExtLiqLTV, maxTwyneLiqLTV), cv.asset(), intermediateVault.unitOfAccount()
+        );
         inHF = collateralValueScaledByLiqLTV * 1e18 / (externalBorrowDebtValue * MAXFACTOR * MAXFACTOR);
     }
 
-    /// @dev Mirrors CollateralVaultBase._collateralScaledByLiqLTV1e8(isRebalancing=false)
-    function _collateralScaledByLiqLTV1e8(address collateralVault, uint256 adjExtLiqLTV)
+    /// @dev Mirrors CollateralVaultBase._collateralScaledByLiqLTV1e8(isRebalancing=false, adjExtLiqLTV,
+    /// maxTwyneLiqLTV, maxRelease()) of Twyne 1.0.7. The caller passes the cap read from liqParams.
+    function _collateralScaledByLiqLTV1e8(ICollateralVaultBase cv, uint256 adjExtLiqLTV, uint256 maxTwyneLiqLTV)
         internal
         view
         returns (uint256)
     {
-        ICollateralVaultBase cv = ICollateralVaultBase(collateralVault);
         uint256 totalAssets = cv.totalAssetsDepositedOrReserved();
         uint256 userCollateral = totalAssets - cv.maxRelease();
-        uint256 maxTwyneLTV = uint256(cv.twyneVaultManager().maxTwyneLTVs(address(cv.intermediateVault())));
 
         return Math.max(
             adjExtLiqLTV * userCollateral,
-            Math.min(adjExtLiqLTV * totalAssets, userCollateral * MAXFACTOR * Math.min(cv.twyneLiqLTV(), maxTwyneLTV))
+            Math.min(adjExtLiqLTV * totalAssets, userCollateral * MAXFACTOR * Math.min(cv.twyneLiqLTV(), maxTwyneLiqLTV))
         );
     }
 
@@ -431,7 +462,11 @@ contract HealthStatViewer {
             }
         }
 
-        IAaveV3DataProvider dataProvider = cv.aaveDataProvider();
+        // AaveV3CollateralVault 1.0.7 keeps its data provider as an internal immutable (no
+        // getter). Resolve it the same way the vault does at construction:
+        // IPool.ADDRESSES_PROVIDER().getPoolDataProvider().
+        IAaveV3DataProvider dataProvider =
+            IAaveV3DataProvider(IAaveV3Pool(cv.targetVault()).ADDRESSES_PROVIDER().getPoolDataProvider());
         (,, uint256 currentLiquidationThreshold,,,,,,,) = dataProvider.getReserveConfigurationData(underlyingAsset);
         return currentLiquidationThreshold;
     }
